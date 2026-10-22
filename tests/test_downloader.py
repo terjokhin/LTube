@@ -150,7 +150,6 @@ def test_prune_deletes_tracks_that_left_the_playlist(tmp_path, monkeypatch):
     [
         (["a", "b"], ["a", "b", "x"], ["YouTube said: INFO - 1 unavailable video is hidden"], "hid unavailable"),
         (["a"], ["a", "x", "y", "z"], [], "refusing to delete more than half"),
-        ([], ["x"], [], "came back empty"),
     ],
 )
 def test_prune_refuses_when_listing_is_untrustworthy(tmp_path, monkeypatch, listed, on_disk, warnings, reason):
@@ -260,3 +259,109 @@ def test_resync_with_unchanged_pattern_renames_nothing(tmp_path, monkeypatch):
     d, events = make_resync(tmp_path, monkeypatch, ["aaaaaaaaaaa"], "{number} - {artist} - {title}")
     d.run("https://x", directory=folder)
     assert not [e for e in events if isinstance(e, TrackRenamed)]
+
+
+def test_empty_listing_fails_the_run_and_deletes_nothing(tmp_path, monkeypatch):
+    warnings = ["YouTube said: INFO - 53 unavailable videos are hidden"]
+    downloader, files, _ = make_pruning_downloader(tmp_path, monkeypatch, [], ["x"], warnings)
+    summary = downloader.run("https://x", directory=tmp_path / "Mix")
+
+    assert summary.aborted.startswith("YouTube listed no tracks") and "hid all of them" in summary.aborted
+    assert files["x"].exists()
+
+
+def make_listing_downloader(tmp_path, monkeypatch, signed_in, signed_out):
+    """A downloader whose signed-in / signed-out listings return these infos (or raise)."""
+    from ltube import downloader as dl
+    from ltube.backoff import BackoffConfig
+
+    cookies = tmp_path / "cookies.txt"
+    cookies.touch()
+    events = []
+    d = dl.PlaylistDownloader(tmp_path, cookies, BackoffConfig(), on_event=events.append)
+    calls = []
+
+    def fake_extract(url, *, signed_in):
+        calls.append(signed_in)
+        result = signed_in_info if signed_in else signed_out
+        if isinstance(result, Exception):
+            raise result
+        if signed_in:
+            d._logger.warnings.append("YouTube said: INFO - 3 unavailable videos are hidden")
+        return result
+
+    signed_in_info = signed_in
+    monkeypatch.setattr(d, "_extract_listing", fake_extract)
+    return d, events, calls
+
+
+def entries(*ids, titled=True):
+    return [{"id": i, "title": f"T-{i}" if titled else None} for i in ids]
+
+
+def test_hidden_private_tracks_are_recovered_from_a_signed_out_listing(tmp_path, monkeypatch):
+    from ltube.downloader import _HIDDEN_UNAVAILABLE_RE, YtdlpWarning
+
+    signed_in = {"id": "PL1", "title": "Mix", "playlist_count": 3, "entries": entries("b")}
+    signed_out = {"id": "PL1", "title": "Mix", "playlist_count": 3, "entries": entries("a", "b", "c", titled=False)}
+    d, events, calls = make_listing_downloader(tmp_path, monkeypatch, signed_in, signed_out)
+
+    title, items, _ = d._list_playlist("https://x")
+
+    assert calls == [True, False]
+    assert [(i.id, i.title) for i in items] == [("a", "a"), ("b", "T-b"), ("c", "c")]
+    assert any("hid 2 tracks" in e.message for e in events if isinstance(e, YtdlpWarning))
+    # Complete now, so the hidden-videos warning must not block pruning.
+    assert not any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in d._logger.warnings)
+
+
+def test_private_playlist_keeps_signed_in_listing(tmp_path, monkeypatch):
+    from yt_dlp.utils import DownloadError
+
+    signed_in = {"id": "PL1", "title": "Mix", "playlist_count": 3, "entries": entries("b")}
+    d, _, calls = make_listing_downloader(tmp_path, monkeypatch, signed_in, DownloadError("ERROR: playlist does not exist"))
+
+    _, items, _ = d._list_playlist("https://x")
+
+    assert calls == [True, False]
+    assert [i.id for i in items] == ["b"]
+    assert d._logger.warnings  # still incomplete: pruning stays blocked
+
+
+def test_no_second_listing_when_nothing_is_hidden(tmp_path, monkeypatch):
+    full = {"id": "PL1", "title": "Mix", "playlist_count": 2, "entries": entries("a", "b")}
+    d, _, calls = make_listing_downloader(tmp_path, monkeypatch, full, None)
+
+    d._list_playlist("https://x")
+
+    assert calls == [True]
+
+
+def test_failed_attempt_removes_only_its_own_new_files(tmp_path):
+    from ltube.downloader import _remove_new_outputs
+
+    other = tmp_path / "A - T.Live.opus"  # another track whose name starts the same way
+    other.touch()
+    before = set(tmp_path.iterdir())
+    for name in ("A - T.m4a", "A - T.png", "A - T.f140.m4a.part"):
+        (tmp_path / name).touch()
+
+    _remove_new_outputs(tmp_path / "A - T.webm", before)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["A - T.Live.opus"]
+
+
+def test_hidden_tracks_come_from_youtube_music_when_available(tmp_path, monkeypatch):
+    from ltube import ytmusic
+
+    signed_in = {"id": "PL1", "title": "Mix", "playlist_count": 2, "entries": []}
+    d, events, calls = make_listing_downloader(tmp_path, monkeypatch, signed_in, None)
+    d._cookie_copy = tmp_path / "cookies.txt"
+    music = [ytmusic.MusicTrack("a", "Song A", ["ZAPRAVKA"], "LP"), ytmusic.MusicTrack("b", "Song B", ["ZAPRAVKA"], None)]
+    monkeypatch.setattr(ytmusic, "music_playlist", lambda cookiefile, playlist_id: music if playlist_id == "PL1" else None)
+
+    _, items, _ = d._list_playlist("https://x")
+
+    assert calls == [True]  # no signed-out listing needed
+    assert [(i.id, i.title) for i in items] == [("a", "Song A"), ("b", "Song B")]
+    assert d._music["a"].artists == ["ZAPRAVKA"]

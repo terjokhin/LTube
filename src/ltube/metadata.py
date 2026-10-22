@@ -7,12 +7,25 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import mutagen
-from yt_dlp.postprocessor import PostProcessor
-from yt_dlp.utils import sanitize_filename
+from yt_dlp.postprocessor import FFmpegPostProcessor, PostProcessor
+from yt_dlp.utils import PostProcessingError, replace_extension, sanitize_filename
+
+if TYPE_CHECKING:
+    from ltube.ytmusic import MusicTrack
 
 TOPIC_SUFFIX = " - Topic"
+# YouTube Music stores songs people upload as private videos on this system channel; it's no artist.
+UPLOADS_CHANNEL = "Music Library Uploads"
+
+# YouTube thumbnails are 16:9; center-crop to a square cover and keep JPEG quality high.
+COVER_FFMPEG_ARGS = [
+    "-c:v", "mjpeg", "-qmin", "1", "-qscale:v", "1",
+    "-vf", "crop='if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'",
+    "-update", "1",
+]  # fmt: skip
 # YouTube Music albums are playlists with this ID prefix, titled "Album - <name>".
 ALBUM_PLAYLIST_PREFIX = "OLAK5uy_"
 ALBUM_TITLE_PREFIX = "Album - "
@@ -24,23 +37,52 @@ def clean_artist(name: str) -> str:
 
 
 class NormalizeMetadataPP(PostProcessor):
-    """Make sure every track has an artist, even uploads YouTube doesn't tag as music.
+    """Tidy what YouTube returns before the file name, tags and cover are chosen.
 
-    Runs right after extraction, so the artist is available both for the filename and
-    for the tags written later by FFmpegMetadata.
+    Makes sure every track has an artist, even uploads YouTube doesn't tag as music, and
+    narrows the thumbnails to ones that can be fetched. Runs right after extraction, so the
+    results reach the filename, the tags written later by FFmpegMetadata, and the cover.
+
+    `music` is YouTube Music's own data for the track (see ltube.ytmusic), when known: for
+    uploads it's the only source of the artist and album.
     """
+
+    def __init__(self, music: MusicTrack | None = None) -> None:
+        super().__init__()
+        self._music = music
 
     def run(self, info):
         artists = info.get("artists") or ([info["artist"]] if info.get("artist") else [])
+        if UPLOADS_CHANNEL in artists:
+            artists = []  # yt-dlp falls back to the uploader, which for uploads is no artist
+        if music := self._music:
+            artists = artists or music.artists
+            if not info.get("album") and music.album:
+                info["album"] = music.album
+            if not info.get("release_year") and music.year:
+                info["release_year"] = music.year
+            if music.album_artists and not info.get("album_artists"):
+                info["album_artists"] = music.album_artists
+            if music.track_number and not info.get("track_number"):
+                info["track_number"] = music.track_number
+                # "3/10": players need the total to show and sort the album properly.
+                info["meta_track"] = f"{music.track_number}/{music.track_count}" if music.track_count else str(music.track_number)
         if not artists:
             uploader = info.get("uploader") or info.get("channel")
-            if uploader:
+            if uploader and uploader != UPLOADS_CHANNEL:
                 artists = [clean_artist(uploader)]
         if artists:
             # YouTube sometimes lists the same artist twice; keep the first occurrence.
             artists = list(dict.fromkeys(artists))
             info["artists"] = artists
             info["artist"] = ", ".join(artists)
+        else:
+            info.pop("artists", None)
+            info.pop("artist", None)
+            # FFmpegMetadata would fall back to the uploader for the tag; an empty override
+            # leaves the artist untagged instead, matching the "Unknown Artist" file name.
+            info["meta_artist"] = ""
+        info["thumbnails"] = usable_thumbnails(info)
         # FFmpegMetadata tags `date` with YouTube's upload date; prefer the release year, which
         # players should show and which scan_existing reads back for {year} when renaming.
         if year := info.get("release_year"):
@@ -55,6 +97,53 @@ _FIELD_RE = re.compile(r"(\{\w+\})")
 # Most filesystems allow 255 bytes per name; leave room for the extension and yt-dlp's
 # temporary suffixes (".part", ".temp").
 MAX_NAME_BYTES = 230
+
+
+def usable_thumbnails(info: dict) -> list[dict]:
+    """The thumbnails worth trying, in yt-dlp's order (it tries the last one first).
+
+    For private videos, such as songs uploaded to YouTube Music, only signed URLs work. yt-dlp
+    would otherwise try ~40 that fail, one request each. Of those, prefer the upload's own
+    square cover art ("vi_locker"), which yt-dlp ranks last.
+    """
+    thumbnails = info.get("thumbnails") or []
+    signed = [t for t in thumbnails if "sqp=" in (t.get("url") or "")]
+    if info.get("availability") != "private" or not signed:
+        return thumbnails
+    covers = [t for t in signed if "/vi_locker/" in t["url"]]
+    return sorted(covers or signed, key=lambda t: t.get("width") or 0)
+
+
+class CoverArtPP(FFmpegPostProcessor):
+    """Turn the downloaded thumbnail into a square JPEG for EmbedThumbnail (runs before_dl).
+
+    Replaces FFmpegThumbnailsConvertor, which makes ffmpeg decode by file extension and so
+    fails on the mislabelled images YouTube serves for uploaded music (JPEG data named .png).
+    Here ffmpeg detects the format from the content. A cover that still can't be converted is
+    dropped with a warning rather than failing the track.
+    """
+
+    def run(self, info):
+        for thumbnail in info.get("thumbnails") or []:
+            source = thumbnail.get("filepath")
+            if not source or not os.path.exists(source):
+                continue
+            target = replace_extension(source, "jpg")
+            tmp = replace_extension(source, "cover.jpg")
+            try:
+                self.real_run_ffmpeg([(source, [])], [(tmp, COVER_FFMPEG_ARGS)])
+            except PostProcessingError as e:
+                self.report_warning(f"Skipping the cover, it couldn't be converted: {e}")
+                for path in (source, tmp):
+                    if os.path.exists(path):
+                        os.remove(path)
+                thumbnail.pop("filepath")
+                continue
+            os.replace(tmp, target)
+            if source != target:
+                os.remove(source)
+            thumbnail["filepath"] = target
+        return [], info
 
 
 def validate_name_pattern(pattern: str) -> str:

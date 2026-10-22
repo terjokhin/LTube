@@ -143,3 +143,91 @@ def test_scan_existing_reads_name_fields(tmp_path):
     found = scan_existing(tmp_path)
     assert found["aaaaaaaaaaa"].fields == {"artist": "A", "title": "Song", "album": "LP", "year": "1997"}
     assert found["bbbbbbbbbbb"].fields == {"artist": "Unknown Artist", "title": "Other", "album": None, "year": None}
+
+
+def test_uploads_channel_is_not_an_artist():
+    from ltube.metadata import UPLOADS_CHANNEL
+
+    info = normalize({"title": "Баблгам", "uploader": UPLOADS_CHANNEL, "artists": [UPLOADS_CHANNEL]})
+    assert "artist" not in info and "artists" not in info
+    assert info["meta_artist"] == ""  # stops FFmpegMetadata tagging the uploads channel
+
+
+def test_private_videos_only_try_signed_thumbnails_preferring_the_upload_cover():
+    from ltube.metadata import usable_thumbnails
+
+    thumbs = [
+        {"url": "https://i.ytimg.com/vi/x/maxresdefault.jpg", "width": 1280},
+        {"url": "https://i9.ytimg.com/vi/x/hqdefault.jpg?sqp=a", "width": 480},
+        {"url": "https://i9.ytimg.com/vi_locker/x/locker.png?sqp=b", "width": 544},
+        {"url": "https://i9.ytimg.com/vi_locker/x/locker.png?sqp=c", "width": 226},
+    ]
+    picked = usable_thumbnails({"availability": "private", "thumbnails": thumbs})
+    assert [t["width"] for t in picked] == [226, 544]  # yt-dlp tries the last (largest) first
+    no_locker = usable_thumbnails({"availability": "private", "thumbnails": thumbs[:2]})
+    assert [t["width"] for t in no_locker] == [480]
+    assert usable_thumbnails({"availability": "public", "thumbnails": thumbs}) == thumbs
+
+
+def run_cover_pp(thumb_path):
+    import imageio_ffmpeg
+    from yt_dlp import YoutubeDL
+
+    from ltube.metadata import CoverArtPP
+
+    with YoutubeDL({"ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(), "quiet": True}) as ydl:
+        _, info = CoverArtPP(ydl).run({"thumbnails": [{"url": "x", "filepath": str(thumb_path)}]})
+    return info["thumbnails"][0]
+
+
+def test_cover_is_converted_by_content_even_when_misnamed(tmp_path):
+    import subprocess
+
+    import imageio_ffmpeg
+
+    misnamed = tmp_path / "01 - A - T.png"
+    jpeg = tmp_path / "src.jpg"
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-f", "lavfi", "-i", "color=red:s=320x180",
+                    "-frames:v", "1", str(jpeg)], check=True)  # fmt: skip
+    jpeg.rename(misnamed)  # JPEG data under a .png name, as YouTube serves for uploads
+
+    thumb = run_cover_pp(misnamed)
+
+    cover = tmp_path / "01 - A - T.jpg"
+    assert thumb["filepath"] == str(cover) and cover.exists() and not misnamed.exists()
+    probe = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", str(cover)], capture_output=True, text=True)
+    assert "180x180" in probe.stderr  # cropped square
+
+
+def test_unconvertible_cover_is_dropped_not_fatal(tmp_path):
+    broken = tmp_path / "01 - A - T.webp"
+    broken.write_bytes(b"not an image")
+
+    thumb = run_cover_pp(broken)
+
+    assert "filepath" not in thumb
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_youtube_music_data_fills_artist_and_album_for_uploads():
+    from ltube.metadata import UPLOADS_CHANNEL
+    from ltube.ytmusic import MusicTrack
+
+    music = MusicTrack("rbSlQPXdBvg", "Баблгам", ["ZAPRAVKA"], "Не трогай, это на Новый Год")
+    _, info = NormalizeMetadataPP(music).run({"title": "Баблгам", "uploader": UPLOADS_CHANNEL})
+    assert (info["artist"], info["album"]) == ("ZAPRAVKA", "Не трогай, это на Новый Год")
+    assert "meta_artist" not in info
+
+    # yt-dlp's own music metadata wins where it exists.
+    _, info = NormalizeMetadataPP(music).run({"title": "T", "artists": ["Real"], "album": "Real LP"})
+    assert (info["artist"], info["album"]) == ("Real", "Real LP")
+
+
+def test_upload_album_details_become_tags():
+    from ltube.ytmusic import MusicTrack
+
+    music = MusicTrack("v", "Ништяк", ["ZAPRAVKA"], "LP", "id", track_number=2, track_count=3, year=2022, album_artists=["ZAPRAVKA"])
+    _, info = NormalizeMetadataPP(music).run({"title": "Ништяк", "uploader": "Music Library Uploads"})
+    assert info["meta_track"] == "2/3" and info["track_number"] == 2
+    assert info["album_artists"] == ["ZAPRAVKA"]
+    assert info["release_year"] == 2022 and info["meta_date"] == "2022"

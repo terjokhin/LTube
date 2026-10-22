@@ -18,11 +18,13 @@ import imageio_ffmpeg
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadCancelled, DownloadError, sanitize_filename
 
+from ltube import ytmusic
 from ltube.backoff import BackoffConfig, inner_retry_sleep
 from ltube.metadata import (
     ALBUM_PLAYLIST_PREFIX,
     ALBUM_TITLE_PREFIX,
     DEFAULT_NAME_PATTERN,
+    CoverArtPP,
     NormalizeMetadataPP,
     TrackNamePP,
     album_folder_name,
@@ -34,12 +36,6 @@ from ltube.metadata import (
 # Final extensions we produce: AAC stays in m4a, Opus is moved from webm into an .opus
 # (Ogg) container. Both are stream copies, the audio is never re-encoded.
 AUDIO_EXTS = ("m4a", "opus")
-
-# YouTube thumbnails are 16:9; center-crop to a square cover and keep JPEG quality high.
-COVER_FFMPEG_ARGS = [
-    "-c:v", "mjpeg", "-qmin", "1", "-qscale:v", "1",
-    "-vf", "crop='if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'",
-]  # fmt: skip
 
 # Checked in order: a rate-limit hint wins over anything else in the same message.
 _RATE_LIMITED_MARKERS = ("http error 429", "too many requests", "not a bot", "rate-limited")
@@ -291,6 +287,10 @@ class PlaylistDownloader:
         self._base_opts: dict = {}
         self._logger = _Logger(on_event, verbose)
         self._current_index = 0
+        self._current_id: str | None = None
+        self._cookie_copy: Path | None = None
+        # Artist/album from YouTube Music for tracks the website hides (uploads), by video ID.
+        self._music: dict[str, ytmusic.MusicTrack] = {}
         self._last_progress = 0.0
 
     def run(self, url: str, *, directory: Path | None = None) -> Summary:
@@ -304,6 +304,7 @@ class PlaylistDownloader:
             # yt-dlp writes refreshed cookies back to its cookie file; keep the user's file untouched.
             cookie_copy = Path(tmp) / "cookies.txt"
             shutil.copyfile(self.cookies, cookie_copy)
+            self._cookie_copy = cookie_copy
             self._base_opts = self._make_base_opts(cookie_copy)
             return self._run(url, directory)
 
@@ -331,9 +332,17 @@ class PlaylistDownloader:
         failures_in_row = 0
         previous: Status | None = None
         try:
+            if not items:
+                hidden = any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in listing_warnings)
+                summary.aborted = "YouTube listed no tracks for this playlist" + (
+                    "; it hid all of them as unavailable (private videos in a private playlist can't be listed)"
+                    if hidden
+                    else ""
+                )
             for idx, item in enumerate(items, 1):
                 self._check_stop()
                 self._current_index = idx
+                self._current_id = item.id
                 result = None
                 if known := on_disk.get(item.id):
                     result = TrackResult(Status.EXISTS, known.path, known.label, known.duration)
@@ -371,28 +380,67 @@ class PlaylistDownloader:
     def _list_playlist(self, url: str) -> tuple[str, list[_PlaylistItem], bool]:
         """Playlist title, its tracks, and whether it is a YouTube Music album."""
         self._logger.warnings.clear()  # _prune checks what this listing warned about
+        info = self._extract_listing(url, signed_in=True)
+        if not info or "entries" not in info:
+            raise NotAPlaylistError(f"{url} is not a playlist")
+        items = _playlist_items(info)
+        expected = info.get("playlist_count") or 0
+        if len(items) < expected and any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in self._logger.warnings):
+            items = self._recover_hidden(url, info.get("id") or "", items, expected)
+        is_album = (info.get("id") or "").startswith(ALBUM_PLAYLIST_PREFIX)
+        return info.get("title") or info.get("id") or "Untitled playlist", items, is_album
+
+    def _extract_listing(self, url: str, *, signed_in: bool) -> dict:
         opts = self._base_opts | {"extract_flat": "in_playlist", "noplaylist": False}
+        if not signed_in:
+            opts = {k: v for k, v in opts.items() if k != "cookiefile"}
         with YoutubeDL(opts) as ydl:
             try:
-                info = ydl.extract_info(url, download=False)
+                return ydl.extract_info(url, download=False)
             except DownloadError as e:
                 if classify(str(e)) is ErrorKind.RATE_LIMITED:
                     raise RateLimitedError(_clean(e)) from e
                 raise
-        if not info or "entries" not in info:
-            raise NotAPlaylistError(f"{url} is not a playlist")
 
-        items = [
-            _PlaylistItem(
-                id=entry["id"],
-                url=entry.get("url") or f"https://www.youtube.com/watch?v={entry['id']}",
-                title=entry.get("title") or entry["id"],
+    def _recover_hidden(
+        self, url: str, playlist_id: str, items: list[_PlaylistItem], expected: int
+    ) -> list[_PlaylistItem]:
+        """Find the tracks YouTube hid from the signed-in listing.
+
+        A signed-in listing leaves out private videos, such as songs uploaded to YouTube Music,
+        even when asked to show unavailable videos. The tracks themselves download normally
+        with the cookies. First ask YouTube Music, which lists them with artist and album
+        (remembered for tagging). Failing that, a signed-out listing of the same (public or
+        unlisted) playlist still includes them, untitled. A private playlist can't be listed
+        signed out; keep what we have.
+        """
+        music = ytmusic.music_playlist(self._cookie_copy, playlist_id) if self._cookie_copy else None
+        if music and len(music) > len(items):
+            # Track numbers and years only exist on each album's page: one request per album.
+            music = ytmusic.with_album_details(
+                self._cookie_copy, music, pause=lambda: self._sleep(self.backoff.request_sleep)
             )
-            for entry in info["entries"]
-            if entry and entry.get("id")
-        ]
-        is_album = (info.get("id") or "").startswith(ALBUM_PLAYLIST_PREFIX)
-        return info.get("title") or info.get("id") or "Untitled playlist", items, is_album
+            self._music = {track.video_id: track for track in music}
+            merged = [
+                _PlaylistItem(t.video_id, f"https://music.youtube.com/watch?v={t.video_id}", t.title) for t in music
+            ]
+            source = "YouTube Music"
+        else:
+            try:
+                recovered = _playlist_items(self._extract_listing(url, signed_in=False))
+            except DownloadError:
+                return items
+            if len(recovered) <= len(items):
+                return items
+            titles = {item.id: item.title for item in items}
+            merged = [replace(item, title=titles.get(item.id, item.title)) for item in recovered]
+            source = "a signed-out listing"
+        self.emit(YtdlpWarning(f"YouTube hid {len(merged) - len(items)} tracks when signed in; found them in {source}"))
+        if len(merged) >= expected:
+            # The listing is complete after all, so the hidden-videos warning no longer means a
+            # partial track list and mustn't block pruning.
+            self._logger.warnings = [w for w in self._logger.warnings if not _HIDDEN_UNAVAILABLE_RE.search(w)]
+        return merged
 
     def _rename_existing(self, items: list[_PlaylistItem], on_disk: dict, width: int) -> dict:
         """Rename tracks already on disk to what the current pattern and playlist positions
@@ -444,9 +492,6 @@ class PlaylistDownloader:
         listed = {item.id for item in items}
         stale = [(vid, track) for vid, track in on_disk.items() if vid not in listed]
         if not stale:
-            return
-        if not items:
-            self.emit(PruneSkipped("the playlist came back empty"))
             return
         if any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in listing_warnings):
             self.emit(PruneSkipped("YouTube hid unavailable videos, so the track list may be incomplete"))
@@ -540,8 +585,9 @@ class PlaylistDownloader:
     def _attempt(self, url: str, outtmpl: str, prefix: str) -> TrackResult:
         self._check_stop()
         with YoutubeDL(self._base_opts | self._track_opts(outtmpl)) as ydl:
-            ydl.add_post_processor(NormalizeMetadataPP(), when="pre_process")
+            ydl.add_post_processor(NormalizeMetadataPP(self._music.get(self._current_id)), when="pre_process")
             ydl.add_post_processor(TrackNamePP(self._pattern, prefix), when="pre_process")
+            ydl.add_post_processor(CoverArtPP(ydl), when="before_dl")
             ydl.add_progress_hook(self._on_progress)
             info = ydl.extract_info(url, download=False)
             label = f"{info.get('artist') or 'Unknown Artist'} - {info.get('track') or info.get('title')}"
@@ -550,7 +596,14 @@ class PlaylistDownloader:
             if existing := _find_existing(target):
                 return TrackResult(Status.EXISTS, existing, label, info.get("duration"))
 
-            ydl.process_ie_result(info, download=True)
+            before = set(target.parent.iterdir()) if target.parent.exists() else set()
+            try:
+                ydl.process_ie_result(info, download=True)
+            except BaseException:
+                # Never leave a half-processed file (e.g. untagged after a failed post-processing
+                # step): a retry or resync would take it for a finished track.
+                _remove_new_outputs(target, before)
+                raise
             path = _find_existing(target)
             if path is None:
                 raise DownloadError(f"download finished but no audio file found next to {target}")
@@ -584,14 +637,39 @@ class PlaylistDownloader:
             "outtmpl": outtmpl,
             "noplaylist": True,
             "writethumbnail": True,
+            # The cover is made square by CoverArtPP (added in _attempt), before EmbedThumbnail.
             "postprocessors": [
-                {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "webm>opus"},
                 {"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": False},
                 {"key": "EmbedThumbnail"},
             ],
-            "postprocessor_args": {"thumbnailsconvertor+ffmpeg_o": COVER_FFMPEG_ARGS},
         }
+
+
+def _playlist_items(info: dict) -> list[_PlaylistItem]:
+    return [
+        _PlaylistItem(
+            id=entry["id"],
+            url=entry.get("url") or f"https://www.youtube.com/watch?v={entry['id']}",
+            title=entry.get("title") or entry["id"],
+        )
+        for entry in info.get("entries") or []
+        if entry and entry.get("id")
+    ]
+
+
+def _remove_new_outputs(target: Path, before: set[Path]) -> None:
+    """Delete the files a failed attempt created for this track (audio, .part, thumbnails).
+
+    Only files that didn't exist before the attempt, so another track whose name merely
+    starts the same way is never touched.
+    """
+    if not target.parent.exists():
+        return
+    prefix = target.stem + "."
+    for path in set(target.parent.iterdir()) - before:
+        if path.name.startswith(prefix) and path.is_file():
+            path.unlink(missing_ok=True)
 
 
 def _find_existing(target: Path) -> Path | None:

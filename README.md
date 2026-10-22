@@ -37,6 +37,7 @@ Other Subsonic clients work too, for example on Android or desktop; see [Navidro
 - **No re-encoding.** Audio is saved exactly as YouTube serves it (Opus in `.opus`, or AAC in `.m4a`), tagged, with square cover art embedded.
 - **File name patterns.** Build names from `{number}`, `{artist}`, `{title}`, `{album}` and `{year}`, separately for albums and playlists.
 - **Resync.** Files you already have are recognised by their YouTube ID, so they are skipped without asking YouTube again. They're renamed if you changed the pattern or the playlist order. Optionally, tracks removed from the playlist are deleted, with safeguards against unreliable listings.
+- **Your own uploads.** Songs you uploaded to YouTube Music are tagged from YouTube Music itself: artist, album, album artist, year and track number, so albums play in order.
 - **Favourites.** Keep the playlists you care about one click away for resyncing.
 - **Polite by design.** Random pauses between tracks, exponential backoff on errors, and an immediate stop if YouTube starts rate-limiting. All of it is adjustable in Settings.
 - **Live progress** in the browser, a download queue, and a cancel button.
@@ -229,6 +230,6 @@ Local builds are snapshots unless you pass a version: `docker build --build-arg 
 
 LTube is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE).
 
-It builds on [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), [mutagen](https://github.com/quodlibet/mutagen) (GPL-2.0-or-later), [FastAPI](https://fastapi.tiangolo.com/) (MIT), [SvelteKit](https://svelte.dev/) (MIT), and a GPL build of [FFmpeg](https://ffmpeg.org/) bundled through [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg).
+It builds on [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), [ytmusicapi](https://github.com/sigma67/ytmusicapi) (MIT), [mutagen](https://github.com/quodlibet/mutagen) (GPL-2.0-or-later), [FastAPI](https://fastapi.tiangolo.com/) (MIT), [SvelteKit](https://svelte.dev/) (MIT), and a GPL build of [FFmpeg](https://ffmpeg.org/) bundled through [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg).
 
 YouTube and YouTube Music are trademarks of Google LLC. CarPlay is a trademark of Apple Inc.
