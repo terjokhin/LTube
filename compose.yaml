@@ -2,7 +2,12 @@
 # (or put MUSIC_DIR=/absolute/path in a .env file next to this one)
 services:
   ltube:
-    build: .
+    # Image tag = release version (a git tag); a plain build is a snapshot.
+    image: ltube:${LTUBE_VERSION:-0.0.0-SNAPSHOT}
+    build:
+      context: .
+      args:
+        VERSION: ${LTUBE_VERSION:-0.0.0-SNAPSHOT}
     # The UI has no login: publish on localhost only unless you put auth in front of it.
     ports:
       - "127.0.0.1:8000:8000"

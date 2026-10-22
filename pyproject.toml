@@ -1,6 +1,7 @@
 [project]
 name = "ltube"
-version = "0.1.0"
+# Placeholder: releases are versioned by git tags, and the Docker build passes the tag in (LTUBE_VERSION).
+version = "0.0.0"
 description = "Download YouTube Music playlists to local storage"
 readme = "README.md"
 license = "GPL-3.0-or-later"

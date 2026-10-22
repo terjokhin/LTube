@@ -8,6 +8,7 @@ from typing import Annotated
 import typer
 from yt_dlp.utils import DownloadError, parse_bytes
 
+from ltube import get_version
 from ltube.backoff import BackoffConfig, parse_range
 from ltube.downloader import (
     Event,
@@ -29,8 +30,18 @@ from ltube.downloader import (
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 
+def _print_version(value: bool) -> None:
+    if value:
+        typer.echo(get_version())
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    version: Annotated[
+        bool, typer.Option("--version", callback=_print_version, is_eager=True, help="Show the version and exit.")
+    ] = False,
+) -> None:
     """Download YouTube Music playlists to local storage."""
 
 

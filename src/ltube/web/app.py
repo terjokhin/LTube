@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from yt_dlp.utils import parse_bytes
 
+from ltube import get_version
 from ltube.backoff import BackoffConfig
 from ltube.downloader import Event, NamePatterns, PlaylistDownloader, Subfolders, Summary
 from ltube.metadata import validate_name_pattern
@@ -182,7 +183,7 @@ def create_app(
         yield
         manager.shutdown()
 
-    app = FastAPI(title="ltube", lifespan=lifespan)
+    app = FastAPI(title="ltube", version=get_version(), lifespan=lifespan)
     app.state.manager = manager
 
     def settings_info() -> dict:
