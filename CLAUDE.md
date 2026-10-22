@@ -69,8 +69,8 @@ No system installs are needed: **ffmpeg** comes from the `imageio-ffmpeg` wheel 
 ## Versions, CI and releases
 
 - The version comes from **git tags**, not Python. `pyproject.toml` has a fixed placeholder, `version = "0.0.0"`; don't bump it. `ltube.get_version()` returns `LTUBE_VERSION` (set in the image from the `VERSION` build arg, default `0.0.0-SNAPSHOT`) or the package version. `ltube --version` prints it, and FastAPI reports it.
-- `.github/workflows/ci.yml` runs on pushes to `main`, on PRs, and via `workflow_call`. It runs backend tests (`uv sync --locked` + pytest), the frontend `npm ci`/`check`/`build`, and a Docker build without pushing.
-- `.github/workflows/release.yml` runs on tags `X.Y.Z*` or `vX.Y.Z*`. It reuses CI, then builds amd64+arm64 and pushes `ghcr.io/<owner>/ltube:{version, major.minor, latest}` (metadata-action semver), and verifies the image with `imagetools inspect` and `ltube --version`.
+- `.github/workflows/ci.yml` runs on pushes to `main` and on PRs. It runs backend tests (`uv sync --locked` + pytest), the frontend `npm ci`/`check`/`build`, and a Docker build without pushing.
+- `.github/workflows/release.yml` runs on tags `X.Y.Z*` or `vX.Y.Z*`. It doesn't re-run CI (tags are cut from `main` commits that already passed); it builds amd64+arm64 and pushes `ghcr.io/<owner>/ltube:{version, major.minor, latest}` (metadata-action semver), and verifies the image with `imagetools inspect` and `ltube --version`.
 - Actions are pinned to major tags, except `astral-sh/setup-uv`, which publishes no major tag and is pinned to an exact version. Lint workflows with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:<version>`.
 
 ## Docker

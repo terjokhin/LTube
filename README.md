@@ -215,7 +215,9 @@ The backend is Python (FastAPI, yt-dlp, mutagen) in `src/ltube/`; the UI is Svel
 Versions are **git tags** (`0.1.0`, `1.2.3-rc.1`). The version in `pyproject.toml` is a fixed `0.0.0` placeholder.
 
 - **Every push to `main` and every pull request** runs CI (`.github/workflows/ci.yml`): the backend tests, the UI type-check and build, and a Docker build.
-- **Pushing a tag** runs the same checks, then publishes `ghcr.io/terjokhin/ltube:<version>` (plus `<major>.<minor>` and `latest` for stable versions) for amd64 and arm64 (`.github/workflows/release.yml`).
+- **Pushing a tag** publishes `ghcr.io/terjokhin/ltube:<version>` (plus `<major>.<minor>` and `latest` for stable versions) for amd64 and arm64 (`.github/workflows/release.yml`).
+
+Tests aren't re-run for a tag, so tag a commit on `main` that already passed CI:
 
 ```sh
 git tag 0.1.0 && git push origin 0.1.0

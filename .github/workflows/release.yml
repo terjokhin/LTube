@@ -1,7 +1,7 @@
 name: Release image
 
-# Pushing a version tag (0.1.0 or v0.1.0) tests the code, then publishes
-# ghcr.io/<owner>/ltube:<version> for amd64 and arm64.
+# Pushing a version tag (0.1.0 or v0.1.0) publishes ghcr.io/<owner>/ltube:<version>
+# for amd64 and arm64. Tests aren't re-run here: tag commits on main that already passed CI.
 on:
   push:
     tags:
@@ -12,12 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    uses: ./.github/workflows/ci.yml
-
   image:
     name: Build and push image
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
