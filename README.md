@@ -1,5 +1,7 @@
 # LTube
 
+[![Version](https://img.shields.io/github/v/tag/terjokhin/LTube?sort=semver&label=version)](https://github.com/terjokhin/LTube/tags)
+
 **Download your YouTube Music playlists and albums into your own music library, and keep them in sync.**
 
 LTube is a small self-hosted web app (and CLI) built on [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a playlist or album link and it downloads every track as a properly tagged audio file, with cover art, into a folder you choose. Later it can resync the playlist: new tracks are fetched, and existing files are recognised and renamed to your current naming pattern. Optionally, tracks you removed from the playlist are deleted.
@@ -70,8 +72,6 @@ docker run -d --name ltube -p 127.0.0.1:8000:8000 \
   -v ~/Music:/music -v ltube-data:/data \
   ghcr.io/terjokhin/ltube:latest
 ```
-
-While the repository is private, run `docker login ghcr.io` first, with a token that has `read:packages`.
 
 </details>
 
