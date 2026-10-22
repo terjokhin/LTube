@@ -1,0 +1,17 @@
+# Usage: MUSIC_DIR=~/Music docker compose up --build
+# (or put MUSIC_DIR=/absolute/path in a .env file next to this one)
+services:
+  ltube:
+    build: .
+    # The UI has no login: publish on localhost only unless you put auth in front of it.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Your real music folder; every download lands here. Defaults to ./music in the repo.
+      - ${MUSIC_DIR:-./music}:/music
+      - ltube-data:/data # uploaded cookies.txt and yt-dlp cache
+    # user: "1000:1000" # on Linux, set to your `id -u`:`id -g` if it isn't 1000
+    restart: unless-stopped
+
+volumes:
+  ltube-data:

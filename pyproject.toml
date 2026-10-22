@@ -1,0 +1,34 @@
+[project]
+name = "ltube"
+version = "0.1.0"
+description = "Download YouTube Music playlists to local storage"
+requires-python = ">=3.12"
+dependencies = [
+    "deno>=2.9.7",
+    "fastapi>=0.120",
+    "imageio-ffmpeg>=0.6.0",
+    "mutagen>=1.48.1",
+    "typer>=0.27.3",
+    "uvicorn>=0.38",
+    "yt-dlp[default]>=2026.8.19",
+]
+
+[project.scripts]
+ltube = "ltube.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The built UI is gitignored, and hatch skips ignored files unless listed as artifacts.
+artifacts = ["src/ltube/web/static/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.0",
+    "pytest>=9.1.1",
+]

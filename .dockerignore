@@ -1,0 +1,28 @@
+# Unlike .gitignore, patterns here match from the context root; use **/ for "anywhere".
+
+# VCS, editors, OS
+.git/
+.idea/
+*.iml
+**/.vscode/
+**/.DS_Store
+
+# Python
+.venv/
+.pytest_cache/
+**/__pycache__/
+tests/
+
+# Frontend: dependencies and outputs are rebuilt inside the image
+web/node_modules/
+web/.svelte-kit/
+web/build/
+src/ltube/web/static/
+
+# compose.yaml's default download folder, which may hold a whole music library
+music/
+
+# Never bake a browser session or local settings into the image; upload cookies through Settings.
+**/cookies*.txt
+**/*.cookies.txt
+.env
