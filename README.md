@@ -61,6 +61,21 @@ docker compose up -d --build
 ```
 
 <details>
+<summary>Prebuilt image</summary>
+
+Every release tag publishes a multi-arch image (amd64 and arm64) to GitHub Container Registry:
+
+```sh
+docker run -d --name ltube -p 127.0.0.1:8000:8000 \
+  -v ~/Music:/music -v ltube-data:/data \
+  ghcr.io/terjokhin/ltube:latest
+```
+
+While the repository is private, run `docker login ghcr.io` first, with a token that has `read:packages`.
+
+</details>
+
+<details>
 <summary>Without compose</summary>
 
 ```sh
@@ -194,6 +209,19 @@ cd web && npm run check           # type-check the UI
 ```
 
 The backend is Python (FastAPI, yt-dlp, mutagen) in `src/ltube/`; the UI is SvelteKit in `web/`. `CLAUDE.md` has an architecture overview.
+
+### Versions and releases
+
+Versions are **git tags** (`0.1.0`, `1.2.3-rc.1`). The version in `pyproject.toml` is a fixed `0.0.0` placeholder.
+
+- **Every push to `main` and every pull request** runs CI (`.github/workflows/ci.yml`): the backend tests, the UI type-check and build, and a Docker build.
+- **Pushing a tag** runs the same checks, then publishes `ghcr.io/terjokhin/ltube:<version>` (plus `<major>.<minor>` and `latest` for stable versions) for amd64 and arm64 (`.github/workflows/release.yml`).
+
+```sh
+git tag 0.1.0 && git push origin 0.1.0
+```
+
+Local builds are snapshots unless you pass a version: `docker build --build-arg VERSION=0.1.0 -t ltube:0.1.0 .` Check what's running with `ltube --version`.
 
 ## License
 

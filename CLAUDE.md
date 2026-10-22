@@ -66,9 +66,16 @@ No system installs are needed: **ffmpeg** comes from the `imageio-ffmpeg` wheel 
 - Track file names come from the album/playlist pattern (default `{number} - {artist} - {title}`). `{number}` is the zero-padded playlist position (width ≥ 2) and `{artist}` falls back to `Unknown Artist`. Changing a pattern is safe for existing libraries: the ID-based scan finds old files under their old names. Only untagged files rely on the filename fallback.
 - Audio is never re-encoded: AAC stays `.m4a`; Opus is remuxed from webm to `.opus`. Thumbnail is converted to JPEG, center-cropped to square (`COVER_FFMPEG_ARGS`), and embedded.
 
+## Versions, CI and releases
+
+- The version comes from **git tags**, not Python. `pyproject.toml` has a fixed placeholder, `version = "0.0.0"`; don't bump it. `ltube.get_version()` returns `LTUBE_VERSION` (set in the image from the `VERSION` build arg, default `0.0.0-SNAPSHOT`) or the package version. `ltube --version` prints it, and FastAPI reports it.
+- `.github/workflows/ci.yml` runs on pushes to `main`, on PRs, and via `workflow_call`. It runs backend tests (`uv sync --locked` + pytest), the frontend `npm ci`/`check`/`build`, and a Docker build without pushing.
+- `.github/workflows/release.yml` runs on tags `X.Y.Z*` or `vX.Y.Z*`. It reuses CI, then builds amd64+arm64 and pushes `ghcr.io/<owner>/ltube:{version, major.minor, latest}` (metadata-action semver), and verifies the image with `imagetools inspect` and `ltube --version`.
+- Actions are pinned to major tags, except `astral-sh/setup-uv`, which publishes no major tag and is pinned to an exact version. Lint workflows with `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:<version>`.
+
 ## Docker
 
-`Dockerfile`: a Node stage builds the UI, then a `python:3.13-slim` stage uses uv and runs as uid 1000 (`ltube`). Volumes: `/music` (the host's music folder, from `MUSIC_DIR` in `compose.yaml`, default `./music`) and `/data` (cookies, settings, yt-dlp cache). The `.dockerignore` keeps cookie files out of the image.
+`Dockerfile`: a Node stage (`--platform=$BUILDPLATFORM`, since its output is architecture-independent static files) builds the UI. Then a `python:3.13-slim` stage uses uv and runs as uid 1000 (`ltube`). `ARG VERSION`, the OCI labels and `LTUBE_VERSION` come last, so a new version only rebuilds those layers. Volumes: `/music` (the host's music folder, from `MUSIC_DIR` in `compose.yaml`, default `./music`) and `/data` (cookies, settings, yt-dlp cache). The `.dockerignore` keeps cookie files out of the image.
 
 ## Secrets
 
