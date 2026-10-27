@@ -4,7 +4,7 @@
 
 **Download your YouTube Music playlists and albums into your own music library, and keep them in sync.**
 
-LTube is a small self-hosted web app (and CLI) built on [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a playlist or album link and it downloads every track as a properly tagged audio file, with cover art, into a folder you choose. Later it can resync the playlist: new tracks are fetched, and existing files are recognised and renamed to your current naming pattern. Optionally, tracks you removed from the playlist are deleted.
+LTube is a small self-hosted web app (and CLI) built on [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a playlist or album link and it downloads every track as a properly tagged audio file, with cover art, into a folder you choose. Every track is stored once, however many playlists and albums contain it, and later you can resync a playlist: only the tracks you don't have yet are fetched.
 
 > [!IMPORTANT]
 > **Use LTube legally.** Only download content you have the right to download: your own uploads, content whose license allows it, or what the laws of your country and YouTube's [Terms of Service](https://www.youtube.com/t/terms) permit for personal use. You are solely responsible for how you use this software. LTube is not affiliated with, endorsed by, or sponsored by YouTube or Google.
@@ -33,10 +33,10 @@ Other Subsonic clients work too, for example on Android or desktop; see [Navidro
 
 ## Features
 
-- **Playlists and albums.** Albums go into `Artist - Year - Album` folders, playlists into a folder named after the playlist. Optional `Albums/` and `Playlists/` subfolders keep them apart.
+- **One library, no duplicates.** Tracks are filed by artist and album (`Album Artist/Album/`), whichever playlist or album you downloaded them from. Download a playlist and then an album with one of its songs: the song is there once. A playlist is a small `.m3u8` file in `playlists/` that points at the shared files, in the playlist's order.
 - **No re-encoding.** Audio is saved exactly as YouTube serves it (Opus in `.opus`, or AAC in `.m4a`), tagged, with square cover art embedded.
-- **File name patterns.** Build names from `{number}`, `{artist}`, `{title}`, `{album}` and `{year}`, separately for albums and playlists.
-- **Resync.** Files you already have are recognised by their YouTube ID, so they are skipped without asking YouTube again. They're renamed if you changed the pattern or the playlist order. Optionally, tracks removed from the playlist are deleted, with safeguards against unreliable listings.
+- **File name pattern.** Build names from `{number}`, `{artist}`, `{title}`, `{album}`, `{year}` and `{id}` (the YouTube ID, required: it's how LTube recognises a track it already has).
+- **Resync.** Tracks you already have are recognised by their YouTube ID and skipped without asking YouTube again. A track that first came in on its own and later turns up on an album is moved into that album and retagged, not downloaded twice. LTube never deletes your music: a track removed from a playlist only leaves the playlist file.
 - **Your own uploads.** Songs you uploaded to YouTube Music are tagged from YouTube Music itself: artist, album, album artist, year and track number, so albums play in order.
 - **Favourites.** Keep the playlists you care about one click away for resyncing.
 - **Polite by design.** Random pauses between tracks, exponential backoff on errors, and an immediate stop if YouTube starts rate-limiting. All of it is adjustable in Settings.
@@ -152,13 +152,13 @@ MUSIC_DIR=~/Music docker compose up -d --build
 
 **In LTube**
 
-- **Settings → Download folder:** tick *Use subfolders* to get `Albums/` and `Playlists/`.
-- **Download screen:** tick **Add to favourites** for playlists you want to keep in sync, then use **Favourites → Resync** whenever they change. To have tracks you removed on YouTube disappear from Navidrome too, enable **Settings → Resync → Also delete downloaded files if they were removed from playlist**.
+- **Download screen:** tick **Add to favourites** for playlists you want to keep in sync, then use **Favourites → Resync** whenever they change. A track removed from a playlist on YouTube Music disappears from that playlist in Navidrome, and its file stays in your library.
 
 **In Navidrome** (<http://your-server:4533>)
 
 - Create your admin user on first visit.
-- Navidrome auto-imports `.m3u8` files found in the music folder as playlists (`ND_AUTOIMPORTPLAYLISTS`, on by default). Imported playlists are private to you unless you change `ND_DEFAULTPLAYLISTPUBLICVISIBILITY`.
+- Navidrome auto-imports `.m3u8` files found in the music folder as playlists (`ND_AUTOIMPORTPLAYLISTS`, on by default); LTube puts them in `playlists/`. Imported playlists are private to you unless you change `ND_DEFAULTPLAYLISTPUBLICVISIBILITY`.
+- LTube keeps its index and download staging in a hidden `.ltube/` folder inside the music folder and leaves a `.ndignore` there so Navidrome skips it.
 - Albums need no playlist file: Navidrome builds them from the tags.
 
 See Navidrome's [Docker docs](https://www.navidrome.org/docs/installation/docker/) and [configuration options](https://www.navidrome.org/docs/usage/configuration/options/) for everything else.
@@ -172,16 +172,39 @@ See Navidrome's [Docker docs](https://www.navidrome.org/docs/installation/docker
 
 To stream away from home instead of downloading, Navidrome must be reachable from outside your network, for example over a VPN such as Tailscale or WireGuard, or behind an HTTPS reverse proxy.
 
+## The library
+
+```
+Music/
+├── Daft Punk/
+│   └── Discovery/
+│       ├── 01 - One More Time [xxxxxxxxxxx].opus
+│       └── 02 - Aerodynamic [yyyyyyyyyyy].opus
+├── Some Artist/
+│   └── Singles/
+│       └── 00 - A Song [xxxxxxxxxxx].m4a
+├── playlists/
+│   └── Road trip.m3u8
+└── .ltube/                  index (library.db), download staging; ignored by Navidrome
+```
+
+- A track goes to `Album Artist/Album/`, or `Artist/Singles/` when YouTube knows no album for it. The name comes from the pattern in Settings (default `{number} - {title} [{id}]`); `{number}` is the track's place on its album, `00` if unknown.
+- `.ltube/library.db` remembers which YouTube video is where, and every playlist's order. It is kept in the music folder so it moves with it. If a file is deleted by hand, LTube notices and downloads that track again on the next run.
+- Tracks are built in `.ltube/tmp/` and moved into the library only when complete and tagged, so Navidrome never sees half a file.
+- Only one download run touches a library at a time; a second one (another job, the command line) waits for the first.
+
+> [!NOTE]
+> **Upgrading from a version that used one folder per playlist:** the new layout doesn't read those folders, and there is no migration. Move or delete the old music folder contents and download your playlists again.
+
 ## How resync works
 
-LTube remembers every playlist it has downloaded, and the folder it went into. Downloading the same playlist again, or pressing **Resync** on a favourite, then:
+LTube remembers every playlist it has downloaded. Downloading the same playlist again, or pressing **Resync** on a favourite, then:
 
 1. Lists the playlist again: one request, no downloads yet.
-2. Reads the tags of the files already in that folder and matches them to playlist entries by YouTube video ID. This is local, with no requests.
-3. Renames matched files to the current file name pattern and playlist positions.
-4. Downloads only the tracks that are missing, pausing politely between them.
-5. If enabled, deletes files whose track is no longer in the playlist. This is skipped when the listing can't be trusted: if YouTube hid unavailable videos, if the playlist came back empty, or if more than half the tracks would go.
-6. Rewrites the playlist's `.m3u8` (albums don't get one).
+2. Remembers the playlist's tracks in their order. If YouTube hid unavailable videos from the listing, or more than half the tracks vanished at once, the listing isn't trusted: tracks already remembered stay in the playlist.
+3. Looks each track up in the index by YouTube video ID. This is local, with no requests. Tracks you have are skipped.
+4. Downloads only the tracks that are missing, pausing politely between them. For an album, a track you had as a single is moved into the album and retagged instead.
+5. Rewrites `playlists/<name>.m3u8` (albums don't get one) from the index, so it lists every track you have for that playlist, whichever run fetched it.
 
 ## Running without Docker
 

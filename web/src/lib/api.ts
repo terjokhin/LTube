@@ -27,7 +27,7 @@ export interface Job {
 	directory: string | null;
 	total: number | null;
 	processed: number;
-	counts: Partial<Record<Track['status'] | 'renamed' | 'removed', number>>;
+	counts: Partial<Record<Track['status'] | 'moved', number>>;
 	current: CurrentTrack | null;
 	waiting_until: number | null;
 	messages: string[];
@@ -41,8 +41,6 @@ export interface Playlist {
 	key: string;
 	url: string;
 	favourite: boolean;
-	/** The folder of the first run, which resyncs keep filling; null until then. */
-	directory: string | null;
 	title: string | null;
 	added_at: number;
 	last_synced_at: number | null;
@@ -67,14 +65,8 @@ export interface Settings {
 	out_dir: string;
 	/** Fixed by the server (Docker volume mount); the UI shows it read-only. */
 	out_dir_locked: boolean;
-	use_subfolders: boolean;
-	albums_subfolder: string;
-	playlists_subfolder: string;
-	/** Track file name patterns, see #lib/pattern.ts. */
-	album_pattern: string;
-	playlist_pattern: string;
-	/** Resyncs delete tracks that are no longer in the playlist. */
-	delete_removed: boolean;
+	/** Track file name inside Artist/Album/, see #lib/pattern.ts; must contain {id}. */
+	track_pattern: string;
 	/** Pacing (see src/ltube/backoff.py); seconds unless noted. */
 	sleep_min: number;
 	sleep_max: number;

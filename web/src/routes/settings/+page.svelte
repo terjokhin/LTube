@@ -2,13 +2,12 @@
 	import { api, PACING_FIELDS, type Settings } from '#lib/api.ts';
 	import { datetime } from '#lib/format.ts';
 	import PatternField from '#lib/PatternField.svelte';
-	import { patternProblem } from '#lib/pattern.ts';
+	import { trackPatternProblem } from '#lib/pattern.ts';
 	import { settings } from '#lib/state.svelte.ts';
 
 	const SECTION_FIELDS = {
-		folders: ['out_dir', 'use_subfolders', 'albums_subfolder', 'playlists_subfolder'],
-		names: ['album_pattern', 'playlist_pattern'],
-		resync: ['delete_removed'],
+		folders: ['out_dir'],
+		names: ['track_pattern'],
 		pacing: PACING_FIELDS
 	} as const;
 	type Section = keyof typeof SECTION_FIELDS;
@@ -66,9 +65,7 @@
 	}
 
 	const locked = $derived(settings.value?.out_dir_locked ?? false);
-	const patternsValid = $derived(
-		!!draft && !patternProblem(draft.album_pattern) && !patternProblem(draft.playlist_pattern)
-	);
+	const patternValid = $derived(!!draft && !trackPatternProblem(draft.track_pattern));
 
 	// Cookies
 	let input: HTMLInputElement;
@@ -130,29 +127,10 @@
 			</p>
 		{/if}
 
-		<label class="check">
-			<input type="checkbox" bind:checked={draft.use_subfolders} />
-			Use subfolders for albums and playlists
-		</label>
-		{#if draft.use_subfolders}
-			<div class="pair">
-				<label>
-					<span>Albums subfolder</span>
-					<input type="text" required bind:value={draft.albums_subfolder} />
-				</label>
-				<label>
-					<span>Playlists subfolder</span>
-					<input type="text" required bind:value={draft.playlists_subfolder} />
-				</label>
-			</div>
-		{/if}
 		<p class="muted small">
-			Albums go to <code
-				>{draft.out_dir}/{#if draft.use_subfolders}{draft.albums_subfolder || '…'}/{/if}Artist - Year - Album/</code
-			><br />
-			Playlists go to <code
-				>{draft.out_dir}/{#if draft.use_subfolders}{draft.playlists_subfolder || '…'}/{/if}Playlist name/</code
-			>
+			Tracks are filed by album, whichever playlist they came from:
+			<code>{draft.out_dir}/Album Artist/Album/</code>, or <code>Artist/Singles/</code> for a track without
+			an album. Each playlist is an <code>.m3u8</code> file in <code>{draft.out_dir}/playlists/</code>.
 		</p>
 
 		<div class="actions">
@@ -166,41 +144,21 @@
 		<h2>File names</h2>
 		<p class="muted small">
 			Placeholders with no value for a track (say, no year) are dropped along with their separator.
-			Changing a pattern doesn't re-download anything: files you already have are recognised by their
-			YouTube ID and keep their old names.
+			The pattern must contain <code>{'{title}'}</code> and <code>{'{id}'}</code>: the YouTube ID is how
+			ltube recognises a track it already has. {'{number}'} is the track's place on its album, <code>00</code>
+			if unknown. Changing the pattern doesn't rename anything: tracks already in your library keep their names.
 		</p>
-		<PatternField label="Album tracks" bind:value={draft.album_pattern} />
-		<PatternField label="Playlist tracks" bind:value={draft.playlist_pattern} />
+		<PatternField label="Track file name" bind:value={draft.track_pattern} prefix="Russian Circles/Nine/" />
 		<div class="actions">
 			<button
 				class="primary"
 				type="submit"
-				disabled={!changed('names') || !patternsValid || saving === 'names'}
+				disabled={!changed('names') || !patternValid || saving === 'names'}
 			>
 				Save
 			</button>
 			{#if sectionError.names}<span class="error">{sectionError.names}</span>{/if}
 			{#if sectionNotice.names && !changed('names')}<span class="ok">{sectionNotice.names}</span>{/if}
-		</div>
-	</form>
-
-	<form class="card stack" onsubmit={(e) => save('resync', e)}>
-		<h2>Resync</h2>
-		<label class="check">
-			<input type="checkbox" bind:checked={draft.delete_removed} />
-			Also delete downloaded files if they were removed from playlist
-		</label>
-		<p class="muted small">
-			Applies to resyncs: a favourite's Resync button, or downloading a playlist again. Only files ltube
-			downloaded (recognised by their YouTube ID) are deleted, and only after a complete resync. Nothing is deleted if YouTube hid unavailable videos from the listing, or if more than half
-			of the playlist's tracks would go at once.
-		</p>
-		<div class="actions">
-			<button class="primary" type="submit" disabled={!changed('resync') || saving === 'resync'}>
-				Save
-			</button>
-			{#if sectionError.resync}<span class="error">{sectionError.resync}</span>{/if}
-			{#if sectionNotice.resync && !changed('resync')}<span class="ok">{sectionNotice.resync}</span>{/if}
 		</div>
 	</form>
 
@@ -319,29 +277,6 @@
 	}
 	.stack p {
 		margin: 0;
-	}
-	.check {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-	}
-	.pair {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 0.75rem;
-	}
-	.pair label {
-		display: grid;
-		gap: 0.3rem;
-	}
-	.pair span {
-		font-weight: 600;
-		font-size: 0.9rem;
-	}
-	@media (max-width: 520px) {
-		.pair {
-			grid-template-columns: 1fr;
-		}
 	}
 	.grid {
 		display: grid;

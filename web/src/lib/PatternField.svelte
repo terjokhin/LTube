@@ -1,14 +1,15 @@
 <script lang="ts">
-	import { EXAMPLE, NAME_FIELDS, patternProblem, renderName } from './pattern';
+	import { EXAMPLE, NAME_FIELDS, renderName, trackPatternProblem } from './pattern';
 
 	let {
 		label,
 		value = $bindable(),
+		prefix = '',
 		example = EXAMPLE
-	}: { label: string; value: string; example?: Record<string, string> } = $props();
+	}: { label: string; value: string; prefix?: string; example?: Record<string, string> } = $props();
 
 	let input: HTMLInputElement;
-	const problem = $derived(patternProblem(value));
+	const problem = $derived(trackPatternProblem(value));
 	const preview = $derived(renderName(value, example));
 
 	/** Insert a placeholder at the cursor (or replace the selection) and keep typing from there. */
@@ -37,7 +38,7 @@
 	{#if problem}
 		<small class="error">{problem}</small>
 	{:else}
-		<small class="muted">e.g. <code>{preview}.opus</code></small>
+		<small class="muted">e.g. <code>{prefix}{preview}.opus</code></small>
 	{/if}
 </div>
 

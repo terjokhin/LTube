@@ -150,7 +150,6 @@
 		color: var(--bad);
 	}
 	.count.unavailable,
-	.count.removed,
 	li.unavailable .status {
 		color: var(--warn);
 	}

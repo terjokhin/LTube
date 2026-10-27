@@ -62,11 +62,10 @@
 			bind:value={url}
 		/>
 	</label>
-	{#if known?.directory}
+	{#if known?.last_synced_at}
 		<p class="notice small">
-			Downloaded before to <code>{known.directory}</code>. This resyncs it: only missing tracks are
-			downloaded, existing files are renamed to the current pattern{#if settings.value?.delete_removed}, and
-				tracks removed from the playlist are deleted{/if}.
+			Downloaded before. This syncs it: only tracks missing from your library are downloaded, and the
+			playlist file is updated.
 		</p>
 	{/if}
 	<label class="check">
@@ -80,13 +79,8 @@
 	{#if settings.value}
 		{@const s = settings.value}
 		<small class="muted">
-			{#if s.use_subfolders}
-				Playlists go to <code>{s.out_dir}/{s.playlists_subfolder}/&lt;playlist name&gt;/</code>, albums to
-				<code>{s.out_dir}/{s.albums_subfolder}/Artist - Year - Album/</code>.
-			{:else}
-				Saving to <code>{s.out_dir}/</code> in a folder named after the playlist, or
-				<code>Artist - Year - Album</code> for albums.
-			{/if}
+			Saving to <code>{s.out_dir}/Album Artist/Album/</code>; a playlist also gets
+			<code>{s.out_dir}/playlists/&lt;name&gt;.m3u8</code>.
 			<a href="/settings/">Change</a>
 		</small>
 	{/if}

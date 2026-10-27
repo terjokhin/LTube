@@ -12,8 +12,7 @@
 		'already exists': 'already there',
 		unavailable: 'unavailable',
 		failed: 'failed',
-		renamed: 'renamed',
-		removed: 'removed'
+		moved: 'moved to album'
 	};
 	const favourites = $derived(live.playlists.filter((p) => p.favourite));
 
@@ -45,12 +44,10 @@
 
 <h1>Favourites</h1>
 <p class="muted intro">
-	Resync downloads only what's missing: tracks added to the playlist since the last run, or ones that
-	failed. Files you already have are recognised and skipped, even if the playlist was reordered, and
-	renamed if you changed the file name pattern.
-	{#if settings.value?.delete_removed}
-		Tracks removed from the playlist are deleted (<a href="/settings/">Settings</a>).
-	{/if}
+	Resync downloads only what's missing from your library: tracks added to the playlist since the last
+	run, or ones that failed. A track already downloaded for another playlist or album is reused, and the
+	playlist file follows the playlist's current order. Tracks removed from the playlist leave the
+	playlist file; the files stay.
 </p>
 
 {#if settings.value && !hasCookies}
@@ -71,9 +68,6 @@
 				<div class="head">
 					<div class="title">
 						<a class="name" href={fav.url} target="_blank" rel="noreferrer">{fav.title ?? fav.url}</a>
-						<span class="muted small" title="Resyncs download into this folder">
-							{fav.directory ?? 'Folder is chosen on the first download'}
-						</span>
 					</div>
 					<button
 						class="primary"
@@ -162,8 +156,7 @@
 	.count.failed {
 		color: var(--bad);
 	}
-	.count.unavailable,
-	.count.removed {
+	.count.unavailable {
 		color: var(--warn);
 	}
 	@media (max-width: 520px) {

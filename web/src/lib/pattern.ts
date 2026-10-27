@@ -1,7 +1,7 @@
 // Mirror of render_name in src/ltube/metadata.py, used for live previews only;
 // the server renders the real file names. Keep the two in sync.
 
-export const NAME_FIELDS = ['number', 'artist', 'title', 'album', 'year'] as const;
+export const NAME_FIELDS = ['number', 'artist', 'title', 'album', 'year', 'id'] as const;
 export type NameField = (typeof NAME_FIELDS)[number];
 
 const FIELD_RE = /(\{\w+\})/;
@@ -11,7 +11,8 @@ export const EXAMPLE: Record<NameField, string> = {
 	artist: 'Russian Circles',
 	title: 'Borehole',
 	album: 'Nine',
-	year: '2026'
+	year: '2026',
+	id: 'x8Wl3TaEQKI'
 };
 
 /** Fill `pattern`; an empty field disappears together with its separator. */
@@ -50,4 +51,9 @@ export function patternProblem(pattern: string): string | null {
 	if (unknown) return `Unknown placeholder {${unknown}}`;
 	if (/[/\\]/.test(pattern)) return "Can't contain slashes";
 	return null;
+}
+
+/** Like patternProblem, for the library layout's track pattern, which must keep the video ID. */
+export function trackPatternProblem(pattern: string): string | null {
+	return patternProblem(pattern) ?? (pattern.includes('{id}') ? null : 'Must contain {id}');
 }
