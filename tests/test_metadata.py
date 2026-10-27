@@ -2,12 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_track
 from ltube.metadata import (
+    DEFAULT_TRACK_PATTERN,
+    MAX_NAME_BYTES,
+    LibraryNamePP,
     NormalizeMetadataPP,
-    album_folder_name,
+    library_location,
     render_name,
     validate_name_pattern,
+    validate_track_pattern,
     write_m3u8,
 )
 
@@ -37,45 +40,23 @@ def test_no_artist_information_leaves_fields_unset():
     assert "artist" not in normalize({"title": "Song"})
 
 
-def test_write_m3u8(tmp_path):
-    playlist = tmp_path / "Mix" / "Mix.m3u8"
-    playlist.parent.mkdir()
+def test_write_m3u8_points_across_folders_and_creates_its_own(tmp_path):
+    playlist = tmp_path / "playlists" / "Mix.m3u8"
     write_m3u8(
         playlist,
         [
-            (playlist.parent / "01 - A - One.opus", 201.4, "A - One"),
-            (playlist.parent / "02 - B - Two.m4a", None, "B - Two"),
+            (tmp_path / "A" / "LP" / "01 - One.opus", 201.4, "A - One"),
+            (tmp_path / "B" / "Singles" / "00 - Two.m4a", None, "B - Two"),
         ],
     )
     assert playlist.read_text(encoding="utf-8").splitlines() == [
         "#EXTM3U",
         "#EXTINF:201,A - One",
-        "01 - A - One.opus",
+        "../A/LP/01 - One.opus",
         "#EXTINF:-1,B - Two",
-        "02 - B - Two.m4a",
+        "../B/Singles/00 - Two.m4a",
     ]
-
-
-def test_album_folder_name():
-    assert album_folder_name("Daft Punk", 2001, "Discovery") == "Daft Punk - 2001 - Discovery"
-    assert album_folder_name("Daft Punk", None, "Discovery") == "Daft Punk - Discovery"
-    assert album_folder_name(None, 2001, "Discovery") == "Unknown Artist - 2001 - Discovery"
-
-
-def test_scan_existing_finds_video_ids_in_tags(tmp_path):
-    from ltube.metadata import scan_existing
-
-    url = "https://www.youtube.com/watch?v=P8X9ESwV0b0"
-    make_track(tmp_path / "07 - Russian Circles - Borehole.opus", purl=url, artist="Russian Circles", title="Borehole")
-    make_track(tmp_path / "02 - B - Two.m4a", comment="https://www.youtube.com/watch?v=abcdefghijk", title="Two")
-    make_track(tmp_path / "03 - untagged.opus")
-
-    found = scan_existing(tmp_path)
-
-    assert set(found) == {"P8X9ESwV0b0", "abcdefghijk"}
-    assert found["P8X9ESwV0b0"].path.name == "07 - Russian Circles - Borehole.opus"
-    assert found["P8X9ESwV0b0"].label == "Russian Circles - Borehole"
-    assert found["abcdefghijk"].label == "Unknown Artist - Two"
+    assert [p.name for p in playlist.parent.iterdir()] == ["Mix.m3u8"]  # no temp file left
 
 
 @pytest.mark.parametrize(
@@ -100,31 +81,17 @@ def test_validate_name_pattern_rejects(pattern):
         validate_name_pattern(pattern)
 
 
-def test_track_name_goes_through_yt_dlp_output_template(tmp_path):
+def test_library_names_go_through_yt_dlp_output_template_unchanged(tmp_path):
     from yt_dlp import YoutubeDL
 
-    from ltube.metadata import TrackNamePP
-
-    info = {"id": "abc", "title": "AC/DC Cover", "uploader": "Band - Topic", "ext": "opus"}
+    info = {"id": "aaaaaaaaaaa", "title": "AC/DC Cover?", "uploader": "Band - Topic", "ext": "opus"}
     _, info = NormalizeMetadataPP().run(info)
-    _, info = TrackNamePP("{number} - {artist} - {title} ({year})", "07").run(info)
+    _, info = LibraryNamePP(DEFAULT_TRACK_PATTERN).run(info)
     with YoutubeDL({"outtmpl": f"{tmp_path}/%(ltube_name)s.%(ext)s"}) as ydl:
         path = Path(ydl.prepare_filename(info))
 
     assert path.parent == tmp_path
-    assert path.name.startswith("07 - Band - AC") and path.name.endswith(" Cover.opus")
-
-
-def test_track_file_name_sanitizes_like_yt_dlp_and_fits_the_filesystem():
-    from yt_dlp.utils import sanitize_filename
-
-    from ltube.metadata import track_file_name
-
-    name = track_file_name("{artist} - {title}", {"artist": "AC/DC", "title": "What?"})
-    assert name == sanitize_filename("AC/DC - What?") and "/" not in name
-    assert sanitize_filename(name) == name  # yt-dlp sanitizes ltube_name again; must not change it
-    long = track_file_name("{title}", {"title": "Ж" * 300})  # 2 bytes per letter
-    assert len(long.encode()) <= 230 and long == "Ж" * 115
+    assert path.stem == info["ltube_name"] == "00 - AC⧸DC Cover？ [aaaaaaaaaaa]"  # yt-dlp must not change it
 
 
 def test_release_year_is_tagged_instead_of_upload_date():
@@ -132,17 +99,6 @@ def test_release_year_is_tagged_instead_of_upload_date():
     assert info["meta_date"] == "1997"
     _, info = NormalizeMetadataPP().run({"title": "T", "upload_date": "20150101"})
     assert "meta_date" not in info
-
-
-def test_scan_existing_reads_name_fields(tmp_path):
-    from ltube.metadata import scan_existing
-
-    url = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
-    make_track(tmp_path / "x.opus", purl=url, artist="A", title="Song", album="LP", date="1997")
-    make_track(tmp_path / "y.opus", purl=url.replace("a", "b"), title="Other", date="20150101")
-    found = scan_existing(tmp_path)
-    assert found["aaaaaaaaaaa"].fields == {"artist": "A", "title": "Song", "album": "LP", "year": "1997"}
-    assert found["bbbbbbbbbbb"].fields == {"artist": "Unknown Artist", "title": "Other", "album": None, "year": None}
 
 
 def test_uploads_channel_is_not_an_artist():
@@ -231,3 +187,110 @@ def test_upload_album_details_become_tags():
     assert info["meta_track"] == "2/3" and info["track_number"] == 2
     assert info["album_artists"] == ["ZAPRAVKA"]
     assert info["release_year"] == 2022 and info["meta_date"] == "2022"
+
+
+def test_track_pattern_must_keep_the_video_id():
+    assert validate_track_pattern(DEFAULT_TRACK_PATTERN) == DEFAULT_TRACK_PATTERN
+    assert validate_track_pattern(" {title} [{id}] ") == "{title} [{id}]"
+    with pytest.raises(ValueError, match=r"\{id\}"):
+        validate_track_pattern("{number} - {title}")
+    with pytest.raises(ValueError, match=r"\{title\}"):
+        validate_track_pattern("{id}")
+
+
+def location(info, number=None, pattern=DEFAULT_TRACK_PATTERN):
+    folder, name = library_location(pattern, {"id": "aaaaaaaaaaa", "title": "Song"} | info, number)
+    return folder.as_posix(), name
+
+
+def test_album_track_goes_to_album_artist_and_album_folder():
+    info = {"album": "Nine", "artists": ["Russian Circles", "Guest"], "track_number": 3}
+    assert location(info) == ("Russian Circles/Nine", "03 - Song [aaaaaaaaaaa]")
+    # The album artist beats the track artist (compilations), and the album position beats the tag.
+    assert location(info | {"album_artists": ["Various Artists"]}, number=7) == (
+        "Various Artists/Nine", "07 - Song [aaaaaaaaaaa]",
+    )  # fmt: skip
+
+
+def test_track_without_album_goes_to_singles_with_number_zero():
+    assert location({"artists": ["Artist"]}) == ("Artist/Singles", "00 - Song [aaaaaaaaaaa]")
+
+
+def test_track_without_artist_goes_to_unknown_artist():
+    assert location({"album": "LP"}) == ("Unknown Artist/LP", "00 - Song [aaaaaaaaaaa]")
+
+
+def test_pattern_can_use_other_fields():
+    info = {"artist": "A", "artists": ["A"], "album": "LP", "release_year": 2001, "track_number": 2}
+    assert location(info, pattern="{artist} - {title} ({year}) [{id}]")[1] == "A - Song (2001) [aaaaaaaaaaa]"
+
+
+@pytest.mark.parametrize("hostile", ["AC/DC", "..", ".", "...Baby", "  ", "a\\b", "What?"])
+def test_folder_names_cannot_leave_or_hide_the_folder(hostile):
+    folder, _ = library_location(DEFAULT_TRACK_PATTERN, {"id": "x", "title": "T", "artists": [hostile], "album": hostile})
+    assert len(folder.parts) == 2
+    assert all(part and not part.startswith(".") and "/" not in part for part in folder.parts)
+
+
+def test_long_title_is_cut_but_keeps_the_id():
+    folder, name = library_location(
+        DEFAULT_TRACK_PATTERN, {"id": "aaaaaaaaaaa", "title": "я" * 200, "artists": ["A"], "album": "L" * 400}
+    )
+    assert len(name.encode()) <= MAX_NAME_BYTES
+    assert name.startswith("00 - яя") and name.endswith(" [aaaaaaaaaaa]")
+    assert all(len(part.encode()) <= MAX_NAME_BYTES for part in folder.parts)
+
+
+def test_album_position_becomes_the_track_number_tag():
+    _, info = LibraryNamePP(DEFAULT_TRACK_PATTERN, number=4).run({"id": "x", "title": "T", "artists": ["A"]})
+    assert info["track_number"] == 4  # FFmpegMetadata tags `track` from it
+    _, info = LibraryNamePP(DEFAULT_TRACK_PATTERN).run({"id": "x", "title": "T", "artists": ["A"]})
+    assert "track_number" not in info
+
+
+def test_library_name_pp_sets_folder_and_name_apart():
+    _, info = LibraryNamePP(DEFAULT_TRACK_PATTERN, number=4).run(
+        {"id": "aaaaaaaaaaa", "title": "Song", "artists": ["Artist"], "album": "AC/DC"}
+    )
+    assert info["ltube_dir"] == "Artist/AC⧸DC"  # a slash in the album name is not a folder level
+    assert info["ltube_name"] == "04 - Song [aaaaaaaaaaa]"
+
+
+def test_retag_puts_an_opus_track_on_an_album(tmp_path):
+    import mutagen
+
+    from conftest import make_track
+    from ltube.metadata import retag_album
+
+    track = tmp_path / "x.opus"
+    make_track(track, title="Song", artist="A")
+    retag_album(track, album="Disc", album_artist="Band", track_number=2, track_total=9, year=2001)
+    tags = mutagen.File(track).tags
+    assert (tags["album"], tags["albumartist"], tags["tracknumber"], tags["tracktotal"], tags["date"]) == (
+        ["Disc"], ["Band"], ["2"], ["9"], ["2001"],
+    )  # fmt: skip
+    assert (tags["title"], tags["artist"]) == (["Song"], ["A"])
+
+
+def test_retag_puts_an_m4a_track_on_an_album(tmp_path):
+    import mutagen
+
+    from conftest import make_track
+    from ltube.metadata import retag_album
+
+    track = tmp_path / "x.m4a"
+    make_track(track, title="Song", artist="A")
+    retag_album(track, album="Disc", album_artist="Band", track_number=2, track_total=None, year=None)
+    tags = mutagen.File(track).tags
+    assert (tags["\xa9alb"], tags["aART"], tags["trkn"]) == (["Disc"], ["Band"], [(2, 0)])
+    assert "\xa9day" not in tags  # an unknown year is not invented
+    assert (tags["\xa9nam"], tags["\xa9ART"]) == (["Song"], ["A"])
+
+
+def test_retag_refuses_what_is_not_audio(tmp_path):
+    from ltube.metadata import retag_album
+
+    junk = tmp_path / "x.opus"
+    junk.write_bytes(b"not audio")
+    with pytest.raises(ValueError):
+        retag_album(junk, album="Disc", album_artist=None, track_number=1, track_total=None, year=None)

@@ -20,27 +20,21 @@ from yt_dlp.utils import parse_bytes
 
 from ltube import get_version
 from ltube.backoff import BackoffConfig
-from ltube.downloader import Event, NamePatterns, PlaylistDownloader, Subfolders, Summary
-from ltube.metadata import validate_name_pattern
+from ltube.downloader import PlaylistDownloader, Summary
+from ltube.metadata import DEFAULT_TRACK_PATTERN, validate_track_pattern
 from ltube.web.playlists import PlaylistStore
 from ltube.web.jobs import Job, JobManager, Runner
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_COOKIES_BYTES = 1_000_000
 KEEPALIVE_SECONDS = 15
-DEFAULT_SUBFOLDERS = Subfolders(albums="Albums", playlists="Playlists")
 
 
 class SettingsUpdate(BaseModel):
     """Only the fields present are changed."""
 
     out_dir: str | None = None
-    use_subfolders: bool | None = None
-    albums_subfolder: str | None = None
-    playlists_subfolder: str | None = None
-    album_pattern: str | None = None
-    playlist_pattern: str | None = None
-    delete_removed: bool | None = None  # resyncs delete tracks that left the playlist
+    track_pattern: str | None = None  # file name inside Artist/Album/, see metadata.render_name
     # Pacing, see BackoffConfig
     sleep_min: float | None = None
     sleep_max: float | None = None
@@ -102,26 +96,8 @@ def create_app(
             return Path(saved)
         return out_dir
 
-    def current_subfolders() -> Subfolders:
-        saved = _read_json(settings_path)
-        return Subfolders(
-            albums=saved.get("albums_subfolder") or DEFAULT_SUBFOLDERS.albums,
-            playlists=saved.get("playlists_subfolder") or DEFAULT_SUBFOLDERS.playlists,
-        )
-
-    def use_subfolders() -> bool:
-        return bool(_read_json(settings_path).get("use_subfolders"))
-
-    def current_patterns() -> NamePatterns:
-        saved = _read_json(settings_path)
-        default = NamePatterns()
-        return NamePatterns(
-            album=saved.get("album_pattern") or default.album,
-            playlist=saved.get("playlist_pattern") or default.playlist,
-        )
-
-    def delete_removed() -> bool:
-        return bool(_read_json(settings_path).get("delete_removed", False))
+    def current_pattern() -> str:
+        return _read_json(settings_path).get("track_pattern") or DEFAULT_TRACK_PATTERN
 
     def current_pacing() -> dict:
         saved = _read_json(settings_path)
@@ -132,13 +108,11 @@ def create_app(
             job.out_dir,
             cookies_path,
             job.backoff,
-            subfolders=job.subfolders,
-            patterns=job.patterns,
-            prune=job.prune,
+            pattern=job.pattern,
             on_event=on_event,
             stop=stop,
         )
-        return downloader.run(job.url, directory=job.target_dir)
+        return downloader.run(job.url)
 
     def record_sync(job: Job) -> None:
         if not job.playlist_id:
@@ -149,8 +123,8 @@ def create_app(
             "last_counts": job.public(tracks=False)["counts"],
             "last_error": job.error,
         }
-        if job.directory:
-            fields |= {"directory": job.directory, "title": job.title}
+        if job.title:
+            fields["title"] = job.title
         playlists.update(job.playlist_id, **fields)
         publish_playlists()
 
@@ -158,23 +132,13 @@ def create_app(
         manager.broadcast({"type": "playlists", "playlists": playlists.list()})
 
     def submit(record: dict) -> dict:
-        """Queue a run of a known playlist. If it was downloaded before, this is a resync: it fills
-        the folder of the first run (found even if Settings changed since) and may prune.
+        """Queue a run of a known playlist. Downloading one again is a sync: tracks the library
+        already has are skipped, wherever they came from.
         """
         if manager.active_for(record["id"]):
             raise HTTPException(409, "this playlist is already queued or downloading")
-        root = current_out_dir()
-        pinned = Path(record["directory"]) if record.get("directory") else None
-        if pinned and lock_out_dir and not pinned.is_relative_to(root):
-            pinned = None  # recorded outside the Docker mount; it would land inside the container
-        options = {
-            "playlist_id": record["id"],
-            "subfolders": current_subfolders() if use_subfolders() else None,
-            "patterns": current_patterns(),
-            "target_dir": pinned,
-            "prune": pinned is not None and delete_removed(),
-        }
-        return manager.submit(record["url"], root, _backoff(current_pacing()), **options).public()
+        options = {"playlist_id": record["id"], "pattern": current_pattern()}
+        return manager.submit(record["url"], current_out_dir(), _backoff(current_pacing()), **options).public()
 
     manager = JobManager(runner or run_job, on_finish=record_sync)
 
@@ -187,17 +151,10 @@ def create_app(
     app.state.manager = manager
 
     def settings_info() -> dict:
-        subfolders = current_subfolders()
-        patterns = current_patterns()
         return {
             "out_dir": str(current_out_dir()),
             "out_dir_locked": lock_out_dir,
-            "use_subfolders": use_subfolders(),
-            "albums_subfolder": subfolders.albums,
-            "playlists_subfolder": subfolders.playlists,
-            "album_pattern": patterns.album,
-            "playlist_pattern": patterns.playlist,
-            "delete_removed": delete_removed(),
+            "track_pattern": current_pattern(),
             **current_pacing(),
             "pacing_defaults": _pacing_defaults(),
             "cookies": _cookies_info(cookies_path),
@@ -214,19 +171,11 @@ def create_app(
             if lock_out_dir:
                 raise HTTPException(409, "the download folder is fixed by the server (a Docker volume mount)")
             changes["out_dir"] = str(_validate_out_dir(update.out_dir))
-        if update.use_subfolders is not None:
-            changes["use_subfolders"] = update.use_subfolders
-        if update.delete_removed is not None:
-            changes["delete_removed"] = update.delete_removed
-        for key in ("albums_subfolder", "playlists_subfolder"):
-            if (value := getattr(update, key)) is not None:
-                changes[key] = _validate_subfolder(value)
-        for key in ("album_pattern", "playlist_pattern"):
-            if (value := getattr(update, key)) is not None:
-                try:
-                    changes[key] = validate_name_pattern(value)
-                except ValueError as e:
-                    raise HTTPException(422, str(e)) from None
+        if update.track_pattern is not None:
+            try:
+                changes["track_pattern"] = validate_track_pattern(update.track_pattern)
+            except ValueError as e:
+                raise HTTPException(422, str(e)) from None
         pacing = {k: v for k in PACING_FIELDS if (v := getattr(update, k)) is not None}
         if "rate_limit" in pacing:
             pacing["rate_limit"] = pacing["rate_limit"].strip()
@@ -289,7 +238,7 @@ def create_app(
 
     @app.put("/api/playlists/{playlist_id}")
     def update_playlist(playlist_id: str, update: PlaylistUpdate) -> dict:
-        """Add to or remove from Favourites. Files and the remembered folder are kept."""
+        """Add to or remove from Favourites. Downloaded files are kept."""
         record = playlists.update(playlist_id, favourite=update.favourite)
         if record is None:
             raise HTTPException(404, "no such playlist")
@@ -352,15 +301,6 @@ def _validate_out_dir(value: str) -> Path:
     if not os.access(path, os.W_OK):
         raise HTTPException(422, f"{path} is not writable")
     return path
-
-
-def _validate_subfolder(value: str) -> str:
-    """A relative folder (nesting allowed) that stays inside the download folder."""
-    cleaned = value.strip().rstrip("/").strip()
-    parts = Path(cleaned).parts
-    if not cleaned or Path(cleaned).is_absolute() or any(p in ("..", ".") for p in parts):
-        raise HTTPException(422, f"subfolder must be a plain folder name like Albums, got {value!r}")
-    return "/".join(parts)
 
 
 def _read_json(path: Path) -> dict:

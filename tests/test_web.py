@@ -149,57 +149,53 @@ def test_cancel_running_and_queued_jobs(make_client):
 
 def test_downloader_stops_between_tracks(tmp_path, monkeypatch):
     from ltube.backoff import BackoffConfig
-    from ltube.downloader import PlaylistDownloader, _PlaylistItem
+    from ltube.downloader import PlaylistDownloader, _Listing, _PlaylistItem
 
     cookies = tmp_path / "cookies.txt"
     cookies.write_text(COOKIES)
     stop = threading.Event()
     downloader = PlaylistDownloader(tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0), stop=stop)
     items = [_PlaylistItem(f"id{i}", f"https://x/{i}", f"Song {i}") for i in range(3)]
-    monkeypatch.setattr(downloader, "_list_playlist", lambda url: ("Mix", items, False))
+    monkeypatch.setattr(downloader, "_list_playlist", lambda url: _Listing("PL1", "Mix", items, False))
 
-    def fake_track(url, playlist_dir, prefix):
+    def fake_track(url, number):
         stop.set()  # the user cancels while the first track downloads
-        return TrackResult(Status.DOWNLOADED, playlist_dir / f"{prefix}.opus", "A - Song", 10)
+        file = tmp_path / "A" / "LP" / "01 - Song.opus"
+        file.parent.mkdir(parents=True)
+        file.touch()
+        downloader._library.add_track(downloader._current_id, file, artist="A", title="Song")
+        return TrackResult(Status.DOWNLOADED, file, "A - Song", 10)
 
     monkeypatch.setattr(downloader, "_download_track", fake_track)
     summary = downloader.run("https://x")
 
     assert summary.aborted == "cancelled"
     assert len(summary.results) == 1
-    assert (tmp_path / "Mix" / "Mix.m3u8").read_text().count(".opus") == 1
+    assert (tmp_path / "playlists" / "Mix.m3u8").read_text().count(".opus") == 1
 
 
-def test_redownload_acts_as_resync_into_the_first_folder(make_client, tmp_path):
+def test_downloading_a_playlist_again_reuses_its_record(make_client):
     seen = []
-
-    def runner(job, on_event, stop):
-        seen.append((job.target_dir, job.prune))
-        return quick_runner(job, on_event, stop)
-
-    client = make_client(runner=runner)
-    client.put("/api/settings", json={"delete_removed": True})
+    client = make_client(runner=lambda job, on_event, stop: seen.append(job.playlist_id) or quick_runner(job, on_event, stop))
     job = client.post("/api/jobs", json={"url": "https://music.youtube.com/playlist?list=PL123&si=abc"}).json()
     wait_for_state(client, job["id"], "done")
 
     [record] = client.get("/api/playlists").json()
     assert (record["key"], record["favourite"]) == ("PL123", False)
-    assert (record["title"], record["directory"], record["last_state"]) == ("Mix", str(tmp_path / "music" / "Mix"), "done")
+    assert (record["title"], record["last_state"]) == ("Mix", "done")
     assert record["last_counts"] == {"downloaded": 1}
+    assert "directory" not in record  # tracks live in the shared library, not in a folder per playlist
 
-    # Settings change later; downloading the same playlist (any URL form) again resyncs the first folder.
-    client.put("/api/settings", json={"out_dir": str(tmp_path / "elsewhere"), "use_subfolders": True})
+    # The same playlist under another URL form is the same record.
     again = client.post("/api/jobs", json={"url": "https://www.youtube.com/playlist?list=PL123"}).json()
     assert again["playlist_id"] == record["id"]
     wait_for_state(client, again["id"], "done")
-    # The first run has nothing to prune; the re-download does.
-    assert seen == [(None, False), (tmp_path / "music" / "Mix", True)]
+    assert seen == [record["id"], record["id"]]
     assert len(client.get("/api/playlists").json()) == 1
 
 
-def test_favourites_are_a_flag_on_remembered_playlists(make_client, tmp_path):
-    seen = []
-    client = make_client(runner=lambda job, on_event, stop: seen.append(job.target_dir) or quick_runner(job, on_event, stop))
+def test_favourites_are_a_flag_on_remembered_playlists(make_client):
+    client = make_client()
     job = client.post("/api/jobs", json={"url": "https://x/playlist?list=PL1", "favourite": True}).json()
     wait_for_state(client, job["id"], "done")
     [record] = client.get("/api/playlists").json()
@@ -207,11 +203,10 @@ def test_favourites_are_a_flag_on_remembered_playlists(make_client, tmp_path):
 
     sync = client.post(f"/api/playlists/{record['id']}/sync").json()
     wait_for_state(client, sync["id"], "done")
-    assert seen == [None, tmp_path / "music" / "Mix"]
 
-    # Un-favouriting keeps the record (and its folder) for later re-downloads.
+    # Un-favouriting keeps the record for later re-downloads.
     assert client.put(f"/api/playlists/{record['id']}", json={"favourite": False}).json()["favourite"] is False
-    assert client.get("/api/playlists").json()[0]["directory"] == str(tmp_path / "music" / "Mix")
+    assert [p["id"] for p in client.get("/api/playlists").json()] == [record["id"]]
     assert client.put("/api/playlists/nope", json={"favourite": True}).status_code == 404
     assert client.post("/api/playlists/nope/sync").status_code == 404
 
@@ -234,7 +229,7 @@ def test_legacy_favourites_are_migrated(make_client, tmp_path):
     (data / "favourites.json").write_text(json.dumps(legacy))
 
     [record] = make_client().get("/api/playlists").json()
-    assert (record["id"], record["favourite"], record["directory"]) == ("f1", True, "/m/Fedor")
+    assert (record["id"], record["favourite"], record["title"]) == ("f1", True, "Fedor")
     assert not (data / "favourites.json").exists()
 
 
@@ -252,85 +247,37 @@ def test_playlist_key(url, key):
     assert playlist_key(url) == key
 
 
-def test_subfolder_settings(make_client):
-    client = make_client()
-    settings = client.get("/api/settings").json()
-    assert (settings["use_subfolders"], settings["albums_subfolder"], settings["playlists_subfolder"]) == (
-        False,
-        "Albums",
-        "Playlists",
-    )
-
-    res = client.put("/api/settings", json={"use_subfolders": True, "albums_subfolder": " Music/LPs/ "})
-    assert res.json()["use_subfolders"] is True
-    assert res.json()["albums_subfolder"] == "Music/LPs"
-
-    for bad in ["", "../outside", "/abs", "a/../b"]:
-        assert client.put("/api/settings", json={"playlists_subfolder": bad}).status_code == 422
-
-
-def test_jobs_get_subfolders_only_when_enabled(make_client):
-    from ltube.downloader import Subfolders
-
+def test_track_pattern_setting(make_client):
     seen = []
-    client = make_client(runner=lambda job, on_event, stop: seen.append(job.subfolders) or quick_runner(job, on_event, stop))
-    for enabled in (False, True):
-        client.put("/api/settings", json={"use_subfolders": enabled, "albums_subfolder": "LPs"})
-        job = client.post("/api/jobs", json={"url": f"https://x/{enabled}"}).json()
-        wait_for_state(client, job["id"], "done")
-    assert seen == [None, Subfolders(albums="LPs", playlists="Playlists")]
+    client = make_client(runner=lambda job, on_event, stop: seen.append(job.pattern) or quick_runner(job, on_event, stop))
+    assert client.get("/api/settings").json()["track_pattern"] == "{number} - {title} [{id}]"
 
+    for bad in ["{number} - {title}", "{title}", "{id} {genre} {title}", "{artist}/{title} [{id}]", "  "]:
+        assert client.put("/api/settings", json={"track_pattern": bad}).status_code == 422, bad
+    res = client.put("/api/settings", json={"track_pattern": " {artist} - {title} [{id}] "})
+    assert res.json()["track_pattern"] == "{artist} - {title} [{id}]"
 
-def test_locked_folder_still_allows_subfolders(make_client, tmp_path):
-    client = make_client(lock=True)
-    # The UI sends the unchanged (locked) folder along with the other settings.
-    res = client.put("/api/settings", json={"out_dir": str(tmp_path / "music"), "use_subfolders": True})
-    assert res.status_code == 200
-    assert res.json()["use_subfolders"] is True
-
-
-def test_name_pattern_settings_reach_jobs(make_client):
-    seen = []
-    client = make_client(runner=lambda job, on_event, stop: seen.append(job.patterns) or quick_runner(job, on_event, stop))
-    settings = client.get("/api/settings").json()
-    assert settings["playlist_pattern"] == settings["album_pattern"] == "{number} - {artist} - {title}"
-
-    assert client.put("/api/settings", json={"playlist_pattern": "{artist}"}).status_code == 422
-    client.put("/api/settings", json={"playlist_pattern": "{artist} - {title}"})
     job = client.post("/api/jobs", json={"url": "https://x"}).json()
     wait_for_state(client, job["id"], "done")
-    assert seen[0].playlist == "{artist} - {title}"
-    assert seen[0].album == "{number} - {artist} - {title}"
+    assert seen == ["{artist} - {title} [{id}]"]
 
 
-def test_prune_only_on_resync_and_only_when_enabled(make_client):
-    seen = []
-    client = make_client(runner=lambda job, on_event, stop: seen.append(job.prune) or quick_runner(job, on_event, stop))
-    assert client.get("/api/settings").json()["delete_removed"] is False
-
-    first = client.post("/api/jobs", json={"url": "https://x/playlist?list=P2"}).json()
-    wait_for_state(client, first["id"], "done")
-    resync = client.post(f"/api/playlists/{first['playlist_id']}/sync").json()
-    wait_for_state(client, resync["id"], "done")
-    client.put("/api/settings", json={"delete_removed": True})
-    resync = client.post(f"/api/playlists/{first['playlist_id']}/sync").json()
-    wait_for_state(client, resync["id"], "done")
-
-    assert seen == [False, False, True]
+def test_locked_folder_still_allows_the_track_pattern(make_client, tmp_path):
+    client = make_client(lock=True)
+    # The UI sends the unchanged (locked) folder along with the other settings.
+    res = client.put("/api/settings", json={"out_dir": str(tmp_path / "music"), "track_pattern": "{title} [{id}]"})
+    assert res.status_code == 200
+    assert res.json()["track_pattern"] == "{title} [{id}]"
 
 
-def test_removed_tracks_are_counted_on_job_and_playlist(make_client):
-    from ltube.downloader import TrackRemoved
+def test_settings_of_the_old_folder_layout_are_ignored(make_client, tmp_path):
+    import json
 
-    def pruning_runner(job, on_event, stop):
-        summary = quick_runner(job, on_event, stop)
-        on_event(TrackRemoved(job.out_dir / "Mix" / "02 - Old.opus", "A - Old"))
-        return summary
-
-    client = make_client(runner=pruning_runner)
-    job = client.post("/api/jobs", json={"url": "https://x/playlist?list=P3"}).json()
-    done = wait_for_state(client, job["id"], "done")
-    assert done["counts"] == {"downloaded": 1, "removed": 1}
-    assert any("02 - Old.opus" in m for m in done["messages"])
-    [record] = client.get("/api/playlists").json()
-    assert record["last_counts"]["removed"] == 1
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "settings.json").write_text(json.dumps(
+        {"use_subfolders": True, "albums_subfolder": "LPs", "album_pattern": "{artist}", "delete_removed": True, "retries": 2}
+    ))  # fmt: skip
+    settings = make_client().get("/api/settings").json()
+    assert settings["retries"] == 2 and settings["track_pattern"] == "{number} - {title} [{id}]"
+    assert not {"use_subfolders", "albums_subfolder", "album_pattern", "delete_removed"} & set(settings)

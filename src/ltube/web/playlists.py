@@ -26,9 +26,7 @@ def playlist_key(url: str) -> str:
 
 
 class PlaylistStore:
-    """After its first run a playlist pins the exact folder it downloaded into, so later runs
-    fill the same folder even if the playlist is renamed or Settings change.
-    """
+    """Playlists are identified by `playlist_key`, so pasting a URL again finds the same record."""
 
     def __init__(self, path: Path, legacy_favourites: Path | None = None) -> None:
         self._path = path
@@ -61,7 +59,6 @@ class PlaylistStore:
                 "key": key,
                 "url": url.strip(),
                 "favourite": favourite,
-                "directory": None,
                 "title": None,
                 "added_at": time.time(),
                 "last_synced_at": None,

@@ -15,13 +15,11 @@ from ltube.downloader import (
     NotAPlaylistError,
     PlaylistDownloader,
     PlaylistStarted,
-    PruneSkipped,
     RateLimitedError,
     Status,
     Summary,
     TrackFinished,
-    TrackRemoved,
-    TrackRenamed,
+    TrackMoved,
     TrackRetry,
     TrackStarted,
     YtdlpWarning,
@@ -51,7 +49,7 @@ def download(
     out: Annotated[
         Path,
         typer.Option("--out", "-o", file_okay=False, resolve_path=True,
-                     help="Root folder; tracks go to OUT/<playlist name>/."),
+                     help="Library folder; tracks go to OUT/Artist/Album/."),
     ],
     cookies: Annotated[
         Path,
@@ -67,7 +65,7 @@ def download(
     rate_limit: Annotated[str | None, typer.Option(help="Download bandwidth cap, e.g. 2M or 500K (bytes/s).")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show yt-dlp's own output.")] = False,
 ) -> None:  # fmt: skip
-    """Download every track of one playlist, skipping files that already exist."""
+    """Download every track of one playlist, skipping tracks the library already has."""
     try:
         sleep_min, sleep_max = parse_range(sleep)
     except ValueError as e:
@@ -112,7 +110,7 @@ def serve(
     out: Annotated[
         Path,
         typer.Option("--out", "-o", file_okay=False, resolve_path=True, envvar="LTUBE_OUT",
-                     help="Initial download folder; change it later in the UI's Settings."),
+                     help="Initial library folder; change it later in the UI's Settings."),
     ] = Path("~/Music").expanduser(),
     lock_out: Annotated[
         bool,
@@ -146,20 +144,16 @@ def serve(
 def _print_event(event: Event) -> None:
     match event:
         case PlaylistStarted(title, directory, total):
-            typer.echo(f"Playlist: {title} ({total} tracks) -> {directory}")
+            typer.echo(f"Playlist: {title} ({total} tracks) -> library {directory}")
         case TrackStarted(index, total, title):
             typer.echo(f"[{index:0{max(2, len(str(total)))}d}/{total}] {title}")
         case TrackFinished(_, result):
             detail = result.path.name if result.path else result.error
             typer.echo(f"    {result.status.value}: {detail}")
+        case TrackMoved(old, new):
+            typer.echo(f"    moved to its album: {old.name} -> {new.parent.name}/{new.name}")
         case TrackRetry(_, attempt, delay, message):
             typer.echo(f"    attempt {attempt} failed: {message}; retrying in {delay:.0f}s")
-        case TrackRenamed(old, new):
-            typer.echo(f"renamed: {old.name} -> {new.name}")
-        case TrackRemoved(path, _):
-            typer.echo(f"removed (no longer in the playlist): {path.name}")
-        case PruneSkipped(reason):
-            typer.echo(f"not removing tracks that left the playlist: {reason}")
         case YtdlpWarning(message):
             typer.echo(f"    warning: {message}")
 

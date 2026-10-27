@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from ltube.downloader import ErrorKind, _find_existing, classify
@@ -22,165 +24,85 @@ def test_classify(message, kind):
 
 
 def test_find_existing_matches_either_container(tmp_path):
-    target = tmp_path / "01 - Artist - Song 2.0.webm"
-    assert _find_existing(target) is None
-    (tmp_path / "01 - Artist - Song 2.0.opus").touch()
-    assert _find_existing(target) == tmp_path / "01 - Artist - Song 2.0.opus"
+    base = tmp_path / "03 - Song 2.0 [aaaaaaaaaaa]"  # a dot in the name is not an extension
+    assert _find_existing(base) is None
+    (tmp_path / "03 - Song 2.0 [aaaaaaaaaaa].opus").touch()
+    assert _find_existing(base) == tmp_path / "03 - Song 2.0 [aaaaaaaaaaa].opus"
 
 
-def test_album_gets_artist_year_album_folder_and_no_m3u8(tmp_path, monkeypatch):
-    from ltube.backoff import BackoffConfig
-    from ltube.downloader import PlaylistDownloader, Status, TrackResult, _PlaylistItem
+class FakeYDL:
+    """Stands in for YoutubeDL: runs the pre_process post-processors on `FakeYDL.info`, and
+    "downloads" by writing an opus file into the output folder.
+    """
 
-    cookies = tmp_path / "cookies.txt"
-    cookies.touch()
-    downloader = PlaylistDownloader(tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0))
-    items = [_PlaylistItem("id1", "https://x/1", "Track")]
-    monkeypatch.setattr(downloader, "_list_playlist", lambda url: ("Album - Discovery", items, True))
-    monkeypatch.setattr(
-        downloader, "_track_info", lambda url: {"album": "Discovery", "artists": ["Daft Punk", "Romanthony"], "release_year": 2001}
-    )
-    monkeypatch.setattr(
-        downloader, "_download_track", lambda url, d, prefix: TrackResult(Status.DOWNLOADED, d / "01.opus", "A", 1)
-    )
+    info: dict = {}
+    fail: str | None = None
+    downloads: list[str] = []
+    delay = 0.0
+    audio_source = None  # a real audio file to copy instead of writing junk bytes
 
-    summary = downloader.run("https://x")
+    def __init__(self, opts):
+        self.opts = opts
+        self.pps = []
 
-    assert summary.playlist_dir == tmp_path / "Daft Punk - 2001 - Discovery"
-    assert (summary.playlist_dir / "01.opus") in [r.path for r in summary.results]
-    assert not list(summary.playlist_dir.glob("*.m3u8"))
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def add_post_processor(self, pp, when="post_process"):
+        self.pps.append((pp, when))
+
+    def add_progress_hook(self, hook):
+        pass
+
+    def extract_info(self, url, download=False):
+        info = dict(self.info) | {"id": url.rsplit("/", 1)[-1]}
+        for pp, when in self.pps:
+            if when == "pre_process":
+                _, info = pp.run(info)
+        return info
+
+    def process_ie_result(self, info, download=True):
+        import time
+        from pathlib import Path
+
+        from yt_dlp.utils import DownloadError
+
+        self.downloads.append(info["id"])
+        out = Path(self.opts["outtmpl"]).parent
+        if self.audio_source:
+            import shutil
+
+            shutil.copy(self.audio_source, out / f"{info['ltube_name']}.opus")
+        else:
+            (out / f"{info['ltube_name']}.opus").write_bytes(b"audio")
+        (out / f"{info['ltube_name']}.f251.webm.part").touch()
+        time.sleep(self.delay)
+        if self.fail:
+            raise DownloadError(self.fail)
 
 
-def test_resync_skips_tracks_on_disk_without_requests(tmp_path, monkeypatch):
+@pytest.fixture
+def ydl(monkeypatch):
+    from types import SimpleNamespace
+
     from ltube import downloader as dl
-    from ltube.backoff import BackoffConfig
-    from ltube.metadata import ExistingTrack
 
-    cookies = tmp_path / "cookies.txt"
-    cookies.touch()
-    downloader = dl.PlaylistDownloader(tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0))
-    items = [dl._PlaylistItem("new", "https://x/new", "New"), dl._PlaylistItem("old", "https://x/old", "Old")]
-    monkeypatch.setattr(downloader, "_list_playlist", lambda url: ("Renamed On YouTube", items, False))
-    # Downloaded earlier as track 01; a new track was inserted before it since.
-    old_file = tmp_path / "My Mix" / "01 - A - Old.opus"
-    monkeypatch.setattr(dl, "scan_existing", lambda d: {"old": ExistingTrack(old_file, "A - Old", 100.0)})
-    requested = []
+    class Fake(FakeYDL):
+        info = {"title": "Song", "artists": ["Artist"], "album": "Album", "duration": 12}
+        fail = None
+        downloads = []
+        audio_source = None
 
-    def fake_track(url, playlist_dir, prefix):
-        requested.append((url, prefix))
-        return dl.TrackResult(dl.Status.DOWNLOADED, playlist_dir / f"{prefix} - B - New.opus", "B - New", 50)
-
-    monkeypatch.setattr(downloader, "_download_track", fake_track)
-    summary = downloader.run("https://x", directory=tmp_path / "My Mix")
-
-    assert requested == [("https://x/new", "01")]
-    assert summary.playlist_dir == tmp_path / "My Mix"
-    assert [(r.status, r.path.name) for r in summary.results] == [
-        (dl.Status.DOWNLOADED, "01 - B - New.opus"),
-        (dl.Status.EXISTS, "01 - A - Old.opus"),
-    ]
+    monkeypatch.setattr(dl, "YoutubeDL", Fake)
+    monkeypatch.setattr(dl, "CoverArtPP", lambda ydl: SimpleNamespace())
+    return Fake
 
 
-@pytest.mark.parametrize(("is_album", "expected"), [(True, "Albums/A - 2001 - Disc"), (False, "Lists/Mix")])
-def test_subfolders_split_albums_and_playlists(tmp_path, monkeypatch, is_album, expected):
-    from ltube.backoff import BackoffConfig
-    from ltube.downloader import PlaylistDownloader, Status, Subfolders, TrackResult, _PlaylistItem
-
-    cookies = tmp_path / "cookies.txt"
-    cookies.touch()
-    downloader = PlaylistDownloader(
-        tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0),
-        subfolders=Subfolders(albums="Albums", playlists="Lists"),
-    )
-    items = [_PlaylistItem("id1", "https://x/1", "Track")]
-    monkeypatch.setattr(downloader, "_list_playlist", lambda url: ("Mix", items, is_album))
-    monkeypatch.setattr(downloader, "_track_info", lambda url: {"album": "Disc", "artists": ["A"], "release_year": 2001})
-    monkeypatch.setattr(
-        downloader, "_download_track", lambda url, d, prefix: TrackResult(Status.DOWNLOADED, d / "x.opus", "A", 1)
-    )
-
-    assert downloader.run("https://x").playlist_dir == tmp_path / expected
-
-
-def make_pruning_downloader(tmp_path, monkeypatch, listed_ids, on_disk_ids, warnings=()):
-    """A downloader whose playlist lists `listed_ids` and whose folder holds `on_disk_ids`."""
-    from ltube import downloader as dl
-    from ltube.backoff import BackoffConfig
-    from ltube.metadata import ExistingTrack
-
-    cookies = tmp_path / "cookies.txt"
-    cookies.touch()
-    events = []
-    downloader = dl.PlaylistDownloader(
-        tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0), prune=True, on_event=events.append
-    )
-    folder = tmp_path / "Mix"
-    folder.mkdir()
-    files = {vid: folder / f"{vid}.opus" for vid in on_disk_ids}
-    for f in files.values():
-        f.touch()
-    items = [dl._PlaylistItem(vid, f"https://x/{vid}", vid) for vid in listed_ids]
-
-    def fake_list(url):
-        downloader._logger.warnings.extend(warnings)
-        return "Mix", items, False
-
-    monkeypatch.setattr(downloader, "_list_playlist", fake_list)
-    monkeypatch.setattr(dl, "scan_existing", lambda d: {v: ExistingTrack(f, v, 1.0) for v, f in files.items()})
-    monkeypatch.setattr(
-        downloader, "_download_track", lambda url, d, prefix: dl.TrackResult(dl.Status.DOWNLOADED, d / "new.opus", "N", 1)
-    )
-    return downloader, files, events
-
-
-def test_prune_deletes_tracks_that_left_the_playlist(tmp_path, monkeypatch):
-    from ltube.downloader import TrackRemoved
-
-    downloader, files, events = make_pruning_downloader(tmp_path, monkeypatch, ["a", "b", "c", "new"], ["a", "b", "c", "gone"])
-    summary = downloader.run("https://x", directory=tmp_path / "Mix")
-
-    assert summary.removed == [files["gone"]]
-    assert not files["gone"].exists()
-    assert all(files[v].exists() for v in "abc")
-    assert [e.label for e in events if isinstance(e, TrackRemoved)] == ["gone"]
-
-
-@pytest.mark.parametrize(
-    ("listed", "on_disk", "warnings", "reason"),
-    [
-        (["a", "b"], ["a", "b", "x"], ["YouTube said: INFO - 1 unavailable video is hidden"], "hid unavailable"),
-        (["a"], ["a", "x", "y", "z"], [], "refusing to delete more than half"),
-    ],
-)
-def test_prune_refuses_when_listing_is_untrustworthy(tmp_path, monkeypatch, listed, on_disk, warnings, reason):
-    from ltube.downloader import PruneSkipped
-
-    downloader, files, events = make_pruning_downloader(tmp_path, monkeypatch, listed, on_disk, warnings)
-    summary = downloader.run("https://x", directory=tmp_path / "Mix")
-
-    assert summary.removed == []
-    assert all(f.exists() for f in files.values())
-    assert any(reason in e.reason for e in events if isinstance(e, PruneSkipped))
-
-
-def test_prune_skipped_when_run_did_not_finish(tmp_path, monkeypatch):
-    downloader, files, _ = make_pruning_downloader(tmp_path, monkeypatch, ["a", "new"], ["a", "gone"])
-    downloader.stop.set()  # cancelled before the end
-    summary = downloader.run("https://x", directory=tmp_path / "Mix")
-
-    assert summary.aborted == "cancelled"
-    assert files["gone"].exists()
-
-
-def test_no_prune_unless_asked(tmp_path, monkeypatch):
-    downloader, files, _ = make_pruning_downloader(tmp_path, monkeypatch, ["a"], ["a", "gone"])
-    downloader.prune = False
-    assert downloader.run("https://x", directory=tmp_path / "Mix").removed == []
-    assert files["gone"].exists()
-
-
-def make_resync(tmp_path, monkeypatch, playlist, pattern):
-    """Resync `playlist` (video IDs) into tmp_path/Mix with `pattern`; downloading is forbidden."""
+def make_downloader(tmp_path, monkeypatch, ids, *, is_album=False, title="Mix", playlist_id=None, **kwargs):
+    """A downloader over `ids` with the listing faked; YoutubeDL needs the `ydl` fixture."""
     from ltube import downloader as dl
     from ltube.backoff import BackoffConfig
 
@@ -188,86 +110,346 @@ def make_resync(tmp_path, monkeypatch, playlist, pattern):
     cookies.touch()
     events = []
     d = dl.PlaylistDownloader(
-        tmp_path, cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0),
-        patterns=dl.NamePatterns(playlist=pattern), on_event=events.append,
+        tmp_path / "lib", cookies, BackoffConfig(sleep_min=0, sleep_max=0, request_sleep=0, retries=0),
+        on_event=events.append, **kwargs,
     )  # fmt: skip
-    items = [dl._PlaylistItem(v, f"https://x/{v}", v) for v in playlist]
-    monkeypatch.setattr(d, "_list_playlist", lambda url: ("Mix", items, False))
-    monkeypatch.setattr(d, "_download_track", lambda *a: pytest.fail("existing tracks must not be re-downloaded"))
-    return d, events
+    items = [dl._PlaylistItem(i, f"https://x/{i}", f"Title {i}") for i in ids]
+    listing = dl._Listing(playlist_id or f"PL-{title}", title, items, is_album)
+    monkeypatch.setattr(d, "_list_playlist", lambda url: listing)
+    d.events = events
+    return d
 
 
-def tagged(folder, name, vid, **tags):
-    from conftest import make_track
+def test_download_lands_in_artist_album_folder_and_the_index(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import Status
+    from ltube.library import Library
 
-    folder.mkdir(exist_ok=True)
-    make_track(folder / name, purl=f"https://www.youtube.com/watch?v={vid}", **tags)
+    d = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"])
+    summary = d.run("https://x")
 
-
-def purl_of(path):
-    import mutagen
-
-    return mutagen.File(path).tags["purl"][0]
-
-
-def test_resync_renames_to_new_pattern_and_positions(tmp_path, monkeypatch):
-    folder = tmp_path / "Mix"
-    tagged(folder, "01 - A - Song.opus", "aaaaaaaaaaa", artist="A", title="Song", date="2001")
-    tagged(folder, "02 - B - Two.opus", "bbbbbbbbbbb", artist="B", title="Two")
-    d, events = make_resync(tmp_path, monkeypatch, ["bbbbbbbbbbb", "aaaaaaaaaaa"], "{artist} - {title} ({year})")
-
-    summary = d.run("https://x", directory=folder)
-
-    assert sorted(p.name for p in folder.glob("*.opus")) == ["A - Song (2001).opus", "B - Two.opus"]
-    assert {r.path.name for r in summary.results} == {"A - Song (2001).opus", "B - Two.opus"}
-    assert (folder / "Mix.m3u8").read_text().count(".opus") == 2
+    [result] = summary.results
+    expected = tmp_path / "lib" / "Artist" / "Album" / "00 - Song [aaaaaaaaaaa].opus"
+    assert (result.status, result.path) == (Status.DOWNLOADED, expected)
+    assert expected.read_bytes() == b"audio"
+    track = Library(tmp_path / "lib").get_track("aaaaaaaaaaa")
+    assert (track.path, track.artist, track.title, track.album, track.duration_s) == (expected, "Artist", "Song", "Album", 12)
+    # Nothing but the finished track and the index is left behind.
+    assert sorted(p.name for p in expected.parent.iterdir()) == [expected.name]
+    assert list((tmp_path / "lib" / ".ltube" / "tmp").iterdir()) == []
 
 
-def test_resync_swaps_numbers_without_clobbering(tmp_path, monkeypatch):
-    folder = tmp_path / "Mix"
-    tagged(folder, "01 - A - X.opus", "aaaaaaaaaaa", artist="A", title="X")
-    tagged(folder, "02 - B - Y.opus", "bbbbbbbbbbb", artist="B", title="Y")
-    d, _ = make_resync(tmp_path, monkeypatch, ["bbbbbbbbbbb", "aaaaaaaaaaa"], "{number} - {artist} - {title}")
+def test_track_already_in_the_library_is_not_requested_again(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import Status
 
-    d.run("https://x", directory=folder)
+    d = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"])
+    d.run("https://x/playlist")
+    assert ydl.downloads == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
 
-    assert purl_of(folder / "01 - B - Y.opus").endswith("bbbbbbbbbbb")
-    assert purl_of(folder / "02 - A - X.opus").endswith("aaaaaaaaaaa")
-    assert not list(folder.glob(".ltube-rename-*"))
+    # Another playlist (or the same one again) holding one of those tracks and one new one.
+    again = make_downloader(tmp_path, monkeypatch, ["bbbbbbbbbbb", "ccccccccccc"], title="Other")
+    summary = again.run("https://x/other")
 
-
-def test_resync_never_overwrites_a_file_it_does_not_manage(tmp_path, monkeypatch):
-    from ltube.downloader import YtdlpWarning
-
-    folder = tmp_path / "Mix"
-    tagged(folder, "01 - A - X.opus", "aaaaaaaaaaa", artist="A", title="X")
-    (folder / "A - X.opus").write_bytes(b"someone else's file")
-    d, events = make_resync(tmp_path, monkeypatch, ["aaaaaaaaaaa"], "{artist} - {title}")
-
-    d.run("https://x", directory=folder)
-
-    assert (folder / "A - X.opus").read_bytes() == b"someone else's file"
-    assert (folder / "01 - A - X.opus").exists()
-    assert any("already exists" in e.message for e in events if isinstance(e, YtdlpWarning))
+    assert ydl.downloads == ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"]  # b only once
+    assert [r.status for r in summary.results] == [Status.EXISTS, Status.DOWNLOADED]
+    assert summary.results[0].label == "Artist - Song"
+    files = list((tmp_path / "lib").rglob("*.opus"))
+    assert len(files) == 3
 
 
-def test_resync_with_unchanged_pattern_renames_nothing(tmp_path, monkeypatch):
-    from ltube.downloader import TrackRenamed
-
-    folder = tmp_path / "Mix"
-    tagged(folder, "01 - A - X.opus", "aaaaaaaaaaa", artist="A", title="X")
-    d, events = make_resync(tmp_path, monkeypatch, ["aaaaaaaaaaa"], "{number} - {artist} - {title}")
-    d.run("https://x", directory=folder)
-    assert not [e for e in events if isinstance(e, TrackRenamed)]
+def test_second_run_downloads_nothing(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"]).run("https://x")
+    ydl.downloads.clear()
+    summary = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"]).run("https://x")
+    assert ydl.downloads == []
+    assert {r.status.value for r in summary.results} == {"already exists"}
 
 
-def test_empty_listing_fails_the_run_and_deletes_nothing(tmp_path, monkeypatch):
-    warnings = ["YouTube said: INFO - 53 unavailable videos are hidden"]
-    downloader, files, _ = make_pruning_downloader(tmp_path, monkeypatch, [], ["x"], warnings)
-    summary = downloader.run("https://x", directory=tmp_path / "Mix")
+def test_deleted_file_is_downloaded_again(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+    next((tmp_path / "lib").rglob("*.opus")).unlink()
+    make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+    assert ydl.downloads == ["aaaaaaaaaaa", "aaaaaaaaaaa"]
+
+
+def test_file_missing_from_the_index_is_adopted_not_downloaded(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import Status
+    from ltube.library import Library
+
+    file = tmp_path / "lib" / "Artist" / "Album" / "00 - Song [aaaaaaaaaaa].opus"
+    file.parent.mkdir(parents=True)
+    file.write_bytes(b"old")
+
+    summary = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+
+    assert ydl.downloads == []
+    assert summary.results[0].status is Status.EXISTS and file.read_bytes() == b"old"
+    assert Library(tmp_path / "lib").get_track("aaaaaaaaaaa").path == file
+
+
+def test_failed_download_leaves_nothing_in_the_library(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import Status
+
+    ydl.fail = "Unable to download: connection reset"
+    summary = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+
+    assert summary.results[0].status is Status.FAILED
+    assert list((tmp_path / "lib").rglob("*.opus")) == []
+    assert list((tmp_path / "lib").rglob("*.part")) == []  # the half-written file went too
+    from ltube.library import Library
+
+    assert Library(tmp_path / "lib").get_track("aaaaaaaaaaa") is None
+
+
+def test_album_tracks_are_numbered_by_position_and_get_no_playlist_file(tmp_path, monkeypatch, ydl):
+    from ltube.library import Library
+
+    d = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"], is_album=True, title="Album - Album")
+    d.run("https://x")
+
+    names = sorted(p.name for p in (tmp_path / "lib" / "Artist" / "Album").iterdir())
+    assert names == ["01 - Song [aaaaaaaaaaa].opus", "02 - Song [bbbbbbbbbbb].opus"]
+    assert Library(tmp_path / "lib").get_track("bbbbbbbbbbb").track_number == 2
+    assert not (tmp_path / "lib" / "playlists").exists()
+
+
+def test_playlist_file_lists_tracks_from_every_folder(tmp_path, monkeypatch, ydl):
+    d = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"])
+    d.run("https://x")
+
+    lines = (tmp_path / "lib" / "playlists" / "Mix.m3u8").read_text().splitlines()
+    assert [l for l in lines if not l.startswith("#")] == [
+        "../Artist/Album/00 - Song [aaaaaaaaaaa].opus",
+        "../Artist/Album/00 - Song [bbbbbbbbbbb].opus",
+    ]
+
+
+def test_two_runs_at_once_download_a_shared_track_once(tmp_path, monkeypatch, ydl):
+    import threading
+
+    ydl.delay = 0.3
+    first = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"], title="One")
+    second = make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa", "bbbbbbbbbbb"], title="Two")
+    errors = []
+
+    def run(d):
+        try:
+            d.run("https://x")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(d,)) for d in (first, second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+
+    assert errors == []
+    assert sorted(ydl.downloads) == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
+    assert len(list((tmp_path / "lib").rglob("*.opus"))) == 2
+    assert list((tmp_path / "lib").rglob("*.part")) == []
+
+
+def test_staging_leftovers_of_a_killed_run_are_cleared(tmp_path, monkeypatch, ydl):
+    stale = tmp_path / "lib" / ".ltube" / "tmp" / "zzzzzzzzzzz"
+    stale.mkdir(parents=True)
+    (stale / "half.opus.part").touch()
+
+    make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+
+    assert not stale.exists()
+
+
+def test_empty_listing_fails_the_run_and_keeps_the_playlist_file(tmp_path, monkeypatch, ydl):
+    from ltube import downloader as dl
+
+    hidden = "YouTube said: INFO - 53 unavailable videos are hidden"
+    d = make_downloader(tmp_path, monkeypatch, [])
+    listing = dl._Listing("PL1", "Mix", [], False)
+    monkeypatch.setattr(d, "_list_playlist", lambda url: (d._logger.warnings.append(hidden), listing)[1])
+    playlist = tmp_path / "lib" / "playlists" / "Mix.m3u8"
+    playlist.parent.mkdir(parents=True)
+    playlist.write_text("#EXTM3U\nfrom an earlier, fuller run\n")
+
+    summary = d.run("https://x")
 
     assert summary.aborted.startswith("YouTube listed no tracks") and "hid all of them" in summary.aborted
-    assert files["x"].exists()
+    assert "fuller run" in playlist.read_text()
+
+
+def playlist_lines(tmp_path, name="Mix.m3u8"):
+    lines = (tmp_path / "lib" / "playlists" / name).read_text().splitlines()
+    return [re.search(r"\[(\w+)\]\.opus$", line)[1] for line in lines if not line.startswith("#")]
+
+
+def remembered(tmp_path, playlist_id="PL1"):
+    from ltube.library import Library
+
+    return Library(tmp_path / "lib").playlist_items(playlist_id)
+
+
+def test_playlist_follows_the_listing_but_files_stay(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a", "b", "c"], playlist_id="PL1").run("https://x")
+    assert playlist_lines(tmp_path) == ["a", "b", "c"]
+
+    # b leaves the playlist and the order changes: the playlist file follows, the file b stays.
+    make_downloader(tmp_path, monkeypatch, ["c", "a"], playlist_id="PL1").run("https://x")
+
+    assert remembered(tmp_path) == ["c", "a"]
+    assert playlist_lines(tmp_path) == ["c", "a"]
+    assert len(list((tmp_path / "lib").rglob("*.opus"))) == 3
+    assert ydl.downloads == ["a", "b", "c"]
+
+
+def test_incomplete_listing_does_not_drop_remembered_tracks(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import YtdlpWarning
+
+    make_downloader(tmp_path, monkeypatch, ["a", "b", "c"], playlist_id="PL1").run("https://x")
+    d = make_downloader(tmp_path, monkeypatch, ["a", "c"], playlist_id="PL1")
+    d._logger.warnings.append("YouTube said: INFO - 1 unavailable video is hidden")
+
+    d.run("https://x")
+
+    assert remembered(tmp_path) == ["a", "b", "c"]
+    assert playlist_lines(tmp_path) == ["a", "b", "c"]
+    assert any("kept 1 tracks" in e.message for e in d.events if isinstance(e, YtdlpWarning))
+
+
+def test_listing_that_loses_most_of_the_playlist_is_not_believed(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import YtdlpWarning
+
+    make_downloader(tmp_path, monkeypatch, ["a", "b", "c", "d"], playlist_id="PL1").run("https://x")
+    d = make_downloader(tmp_path, monkeypatch, ["a"], playlist_id="PL1")
+
+    d.run("https://x")
+
+    assert remembered(tmp_path) == ["a", "b", "c", "d"]
+    assert any("3 of 4 tracks vanished" in e.message for e in d.events if isinstance(e, YtdlpWarning))
+
+
+def test_failed_tracks_keep_their_place_in_the_playlist(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a"], playlist_id="PL1").run("https://x")
+    ydl.fail = "Unable to download: connection reset"
+
+    make_downloader(tmp_path, monkeypatch, ["a", "b"], playlist_id="PL1").run("https://x")
+
+    assert remembered(tmp_path) == ["a", "b"]
+    assert playlist_lines(tmp_path) == ["a"]  # b has no file yet
+
+    ydl.fail = None
+    make_downloader(tmp_path, monkeypatch, ["a", "b"], playlist_id="PL1").run("https://x")
+    assert playlist_lines(tmp_path) == ["a", "b"]
+
+
+def test_cancelled_run_still_writes_the_whole_playlist_so_far(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a"], playlist_id="PL1").run("https://x")
+    d = make_downloader(tmp_path, monkeypatch, ["a", "b"], playlist_id="PL1")
+    d.stop.set()
+
+    assert d.run("https://x").aborted == "cancelled"
+
+    assert playlist_lines(tmp_path) == ["a"]  # the earlier run's track is not lost
+    assert remembered(tmp_path) == ["a", "b"]
+
+
+def test_renamed_playlist_gets_a_new_file_and_loses_the_old_one(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a"], title="Old name", playlist_id="PL1").run("https://x")
+    make_downloader(tmp_path, monkeypatch, ["a"], title="New name", playlist_id="PL1").run("https://x")
+
+    assert sorted(p.name for p in (tmp_path / "lib" / "playlists").iterdir()) == ["New name.m3u8"]
+
+
+def test_playlists_with_the_same_title_get_separate_files(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a"], playlist_id="PL1").run("https://x")
+    make_downloader(tmp_path, monkeypatch, ["b"], playlist_id="PL2").run("https://x")
+
+    assert sorted(p.name for p in (tmp_path / "lib" / "playlists").iterdir()) == ["Mix (PL2).m3u8", "Mix.m3u8"]
+    assert playlist_lines(tmp_path) == ["a"] and playlist_lines(tmp_path, "Mix (PL2).m3u8") == ["b"]
+
+
+@pytest.fixture
+def real_audio(tmp_path, ydl):
+    from conftest import make_track
+
+    source = tmp_path / "template.opus"
+    make_track(source, title="Song", artist="Artist")
+    ydl.audio_source = source
+
+
+def file_single_then_album(tmp_path, monkeypatch, ydl, **album_info):
+    """A track downloaded on its own (no album), then an album run listing it second."""
+    ydl.info = {"title": "Song", "artists": ["Artist"]}
+    make_downloader(tmp_path, monkeypatch, ["aaaaaaaaaaa"]).run("https://x")
+    ydl.info = {"title": "Other", "artists": ["Artist"], "album": "Disc"}
+    album = make_downloader(tmp_path, monkeypatch, ["bbbbbbbbbbb", "aaaaaaaaaaa"], is_album=True, title="Album - Disc")
+    info = {"album": "Disc", "artists": ["Artist"], "release_year": 2001} | album_info
+    monkeypatch.setattr(album, "_track_info", lambda url: info)
+    return album
+
+
+def test_single_is_filed_under_its_album_when_an_album_run_meets_it(tmp_path, monkeypatch, ydl, real_audio):
+    import mutagen
+
+    from ltube.downloader import Status, TrackMoved
+    from ltube.library import Library
+
+    album = file_single_then_album(tmp_path, monkeypatch, ydl)
+    singles = tmp_path / "lib" / "Artist" / "Singles"
+    assert (singles / "00 - Song [aaaaaaaaaaa].opus").exists()
+
+    summary = album.run("https://x")
+
+    moved = tmp_path / "lib" / "Artist" / "Disc" / "02 - Song [aaaaaaaaaaa].opus"
+    assert ydl.downloads == ["aaaaaaaaaaa", "bbbbbbbbbbb"]  # the single was not downloaded again
+    assert moved.exists() and not singles.exists()  # and the empty Singles folder went
+    assert [(r.status, r.path.name) for r in summary.results] == [
+        (Status.DOWNLOADED, "01 - Other [bbbbbbbbbbb].opus"),
+        (Status.EXISTS, moved.name),
+    ]
+    assert [(e.old.name, e.new) for e in album.events if isinstance(e, TrackMoved)] == [
+        ("00 - Song [aaaaaaaaaaa].opus", moved)
+    ]
+    tags = mutagen.File(moved).tags
+    assert tags["album"] == ["Disc"] and tags["albumartist"] == ["Artist"] and tags["date"] == ["2001"]
+    assert (tags["tracknumber"], tags["tracktotal"], tags["title"]) == (["2"], ["2"], ["Song"])
+    track = Library(tmp_path / "lib").get_track("aaaaaaaaaaa")
+    assert (track.path, track.album, track.album_artist, track.track_number) == (moved, "Disc", "Artist", 2)
+
+
+def test_single_stays_put_when_its_album_spot_is_taken(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import TrackMoved, YtdlpWarning
+
+    album = file_single_then_album(tmp_path, monkeypatch, ydl)
+    taken = tmp_path / "lib" / "Artist" / "Disc" / "02 - Song [aaaaaaaaaaa].opus"
+    taken.parent.mkdir(parents=True)
+    taken.write_bytes(b"someone else's file")
+
+    album.run("https://x")
+
+    assert (tmp_path / "lib" / "Artist" / "Singles" / "00 - Song [aaaaaaaaaaa].opus").exists()
+    assert taken.read_bytes() == b"someone else's file"
+    assert not [e for e in album.events if isinstance(e, TrackMoved)]
+    assert any("already exists" in e.message for e in album.events if isinstance(e, YtdlpWarning))
+
+
+def test_single_stays_put_when_it_cannot_be_tagged(tmp_path, monkeypatch, ydl):
+    from ltube.downloader import TrackMoved, YtdlpWarning
+
+    album = file_single_then_album(tmp_path, monkeypatch, ydl)  # the fake wrote junk, not audio
+
+    summary = album.run("https://x")
+
+    assert (tmp_path / "lib" / "Artist" / "Singles" / "00 - Song [aaaaaaaaaaa].opus").exists()
+    assert summary.results[1].path.parent.name == "Singles"  # still counted as in the library
+    assert any("left 00 - Song" in e.message for e in album.events if isinstance(e, YtdlpWarning))
+    assert not [e for e in album.events if isinstance(e, TrackMoved)]
+
+
+def test_album_is_only_looked_up_when_a_track_needs_it(tmp_path, monkeypatch, ydl):
+    make_downloader(tmp_path, monkeypatch, ["a"], is_album=True, title="Album - Disc").run("https://x")
+    again = make_downloader(tmp_path, monkeypatch, ["a"], is_album=True, title="Album - Disc")
+    monkeypatch.setattr(again, "_track_info", lambda url: pytest.fail("every track is filed already"))
+
+    again.run("https://x")
 
 
 def make_listing_downloader(tmp_path, monkeypatch, signed_in, signed_out):
@@ -306,7 +488,7 @@ def test_hidden_private_tracks_are_recovered_from_a_signed_out_listing(tmp_path,
     signed_out = {"id": "PL1", "title": "Mix", "playlist_count": 3, "entries": entries("a", "b", "c", titled=False)}
     d, events, calls = make_listing_downloader(tmp_path, monkeypatch, signed_in, signed_out)
 
-    title, items, _ = d._list_playlist("https://x")
+    items = d._list_playlist("https://x").items
 
     assert calls == [True, False]
     assert [(i.id, i.title) for i in items] == [("a", "a"), ("b", "T-b"), ("c", "c")]
@@ -321,7 +503,7 @@ def test_private_playlist_keeps_signed_in_listing(tmp_path, monkeypatch):
     signed_in = {"id": "PL1", "title": "Mix", "playlist_count": 3, "entries": entries("b")}
     d, _, calls = make_listing_downloader(tmp_path, monkeypatch, signed_in, DownloadError("ERROR: playlist does not exist"))
 
-    _, items, _ = d._list_playlist("https://x")
+    items = d._list_playlist("https://x").items
 
     assert calls == [True, False]
     assert [i.id for i in items] == ["b"]
@@ -337,20 +519,6 @@ def test_no_second_listing_when_nothing_is_hidden(tmp_path, monkeypatch):
     assert calls == [True]
 
 
-def test_failed_attempt_removes_only_its_own_new_files(tmp_path):
-    from ltube.downloader import _remove_new_outputs
-
-    other = tmp_path / "A - T.Live.opus"  # another track whose name starts the same way
-    other.touch()
-    before = set(tmp_path.iterdir())
-    for name in ("A - T.m4a", "A - T.png", "A - T.f140.m4a.part"):
-        (tmp_path / name).touch()
-
-    _remove_new_outputs(tmp_path / "A - T.webm", before)
-
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["A - T.Live.opus"]
-
-
 def test_hidden_tracks_come_from_youtube_music_when_available(tmp_path, monkeypatch):
     from ltube import ytmusic
 
@@ -360,7 +528,7 @@ def test_hidden_tracks_come_from_youtube_music_when_available(tmp_path, monkeypa
     music = [ytmusic.MusicTrack("a", "Song A", ["ZAPRAVKA"], "LP"), ytmusic.MusicTrack("b", "Song B", ["ZAPRAVKA"], None)]
     monkeypatch.setattr(ytmusic, "music_playlist", lambda cookiefile, playlist_id: music if playlist_id == "PL1" else None)
 
-    _, items, _ = d._list_playlist("https://x")
+    items = d._list_playlist("https://x").items
 
     assert calls == [True]  # no signed-out listing needed
     assert [(i.id, i.title) for i in items] == [("a", "Song A"), ("b", "Song B")]

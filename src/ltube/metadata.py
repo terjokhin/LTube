@@ -5,11 +5,11 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mutagen
+import mutagen.mp4
 from yt_dlp.postprocessor import FFmpegPostProcessor, PostProcessor
 from yt_dlp.utils import PostProcessingError, replace_extension, sanitize_filename
 
@@ -26,9 +26,9 @@ COVER_FFMPEG_ARGS = [
     "-vf", "crop='if(gt(ih,iw),iw,ih)':'if(gt(iw,ih),ih,iw)'",
     "-update", "1",
 ]  # fmt: skip
-# YouTube Music albums are playlists with this ID prefix, titled "Album - <name>".
+# YouTube Music albums are playlists with this ID prefix.
 ALBUM_PLAYLIST_PREFIX = "OLAK5uy_"
-ALBUM_TITLE_PREFIX = "Album - "
+ALBUM_TITLE_PREFIX = "Album - "  # YouTube Music titles an album's playlist "Album - <name>"
 
 
 def clean_artist(name: str) -> str:
@@ -90,9 +90,12 @@ class NormalizeMetadataPP(PostProcessor):
         return [], info
 
 
-# Track file names come from a user pattern (Settings), e.g. "{number} - {artist} - {title}".
-NAME_FIELDS = ("number", "artist", "title", "album", "year")
-DEFAULT_NAME_PATTERN = "{number} - {artist} - {title}"
+# Track file names come from a user pattern (Settings), see DEFAULT_TRACK_PATTERN.
+NAME_FIELDS = ("number", "artist", "title", "album", "year", "id")
+# The library layout (OUT/Album Artist/Album/<this>.ext): the video ID in the name lets the
+# index be rebuilt from the files alone.
+DEFAULT_TRACK_PATTERN = "{number} - {title} [{id}]"
+SINGLES_FOLDER = "Singles"
 _FIELD_RE = re.compile(r"(\{\w+\})")
 # Most filesystems allow 255 bytes per name; leave room for the extension and yt-dlp's
 # temporary suffixes (".part", ".temp").
@@ -180,11 +183,14 @@ def render_name(pattern: str, values: dict[str, str | None]) -> str:
     return "".join(parts).strip().strip("-_ ")
 
 
-def track_file_name(pattern: str, values: dict[str, str | None]) -> str:
-    """The file name (without extension) for a track: rendered, sanitized like yt-dlp does, and
-    trimmed to a safe length. Downloads and resync renames must both use this.
-    """
-    name = sanitize_filename(render_name(pattern, values))
+def validate_track_pattern(pattern: str) -> str:
+    pattern = validate_name_pattern(pattern)
+    if "{id}" not in pattern:
+        raise ValueError("the pattern must contain {id}, which is how ltube recognises a downloaded track")
+    return pattern
+
+
+def _trim_bytes(name: str) -> str:
     encoded = name.encode()
     if len(encoded) > MAX_NAME_BYTES:
         name = encoded[:MAX_NAME_BYTES].decode(errors="ignore").rstrip(" .")
@@ -199,85 +205,115 @@ def track_fields(info: dict, number: str) -> dict[str, str | None]:
         "title": info.get("track") or info.get("title") or info.get("id"),
         "album": info.get("album"),
         "year": str(year) if year else None,
+        "id": info.get("id"),
     }
 
 
-class TrackNamePP(PostProcessor):
-    """Put the pattern-rendered file name in info["ltube_name"] for the output template.
+def folder_name(text: str | None, fallback: str) -> str:
+    """One folder level (or playlist file name): sanitized and length-limited. Leading dots go, since ".." would climb
+    out of the library and ".x" would hide the folder from media servers.
+    """
+    name = _trim_bytes(sanitize_filename(text or "")).strip().lstrip(".").strip()
+    return name or fallback
 
-    Registered after NormalizeMetadataPP, so the artist is already filled in.
+
+def _fit_name(pattern: str, values: dict[str, str | None]) -> str:
+    """Like track_file_name, but a name that is too long loses the end of the title, not the
+    end of the name, so the [id] survives.
+    """
+    title = values["title"] or ""
+    while True:
+        name = sanitize_filename(render_name(pattern, values | {"title": title}))
+        excess = len(name.encode()) - MAX_NAME_BYTES
+        if excess <= 0 or not title:
+            return _trim_bytes(name)
+        title = title.encode()[:-excess].decode(errors="ignore").rstrip()
+
+
+def library_location(pattern: str, info: dict, number: int | None = None) -> tuple[Path, str]:
+    """Where a track goes in the library: (folder relative to its root, file name without extension).
+
+    The folder is `Album Artist/Album`, or `Artist/Singles` for a track without an album.
+    `number` is the track's position on its album when the caller knows it (an album download);
+    otherwise the track's own number from YouTube, and 00 if it has none.
+    """
+    album_artist = (
+        (info.get("album_artists") or [None])[0]
+        or info.get("album_artist")
+        or (info.get("artists") or [None])[0]
+        or "Unknown Artist"
+    )
+    folder = Path(folder_name(album_artist, "Unknown Artist"), folder_name(info.get("album"), SINGLES_FOLDER))
+    return folder, _fit_name(pattern, track_fields(info, f"{number or info.get('track_number') or 0:02d}"))
+
+
+class LibraryNamePP(PostProcessor):
+    """Put the track's library folder and file name in info["ltube_dir"] and info["ltube_name"].
+
+    Registered after NormalizeMetadataPP, so the artist is already filled in. The folder is kept
+    apart from the name because yt-dlp would sanitize a "/" inside a single field value.
+
+    `number` is the track's position on its album, when the caller knows it. It also becomes the
+    track number tag, which is what media servers order an album by.
     """
 
-    def __init__(self, pattern: str, number: str) -> None:
+    def __init__(self, pattern: str, number: int | None = None) -> None:
         super().__init__()
         self._pattern = pattern
         self._number = number
 
     def run(self, info):
-        info["ltube_name"] = track_file_name(self._pattern, track_fields(info, self._number))
+        if self._number:
+            info["track_number"] = self._number
+        folder, name = library_location(self._pattern, info, self._number)
+        info["ltube_dir"], info["ltube_name"] = folder.as_posix(), name
         return [], info
 
 
-def album_folder_name(artist: str | None, year: int | None, album: str) -> str:
-    """ "Artist - Year - Album"; the year is left out when YouTube doesn't know it."""
-    parts = [artist or "Unknown Artist", str(year) if year else None, album]
-    return " - ".join(p for p in parts if p)
-
-
-# FFmpegMetadata stores the video URL in `purl`/`comment` (`©cmt` in m4a).
-_VIDEO_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/)([0-9A-Za-z_-]{11})")
-_SKIP_TAGS = {"metadata_block_picture", "covr"}  # embedded cover art, large and irrelevant
-
-
-@dataclass(frozen=True)
-class ExistingTrack:
-    path: Path
-    label: str
-    duration: float | None
-    # Name fields from the tags (track_fields minus number), for renaming to a new pattern.
-    fields: dict[str, str | None] = field(default_factory=dict)
-
-
-def scan_existing(directory: Path, exts: Iterable[str] = ("m4a", "opus")) -> dict[str, ExistingTrack]:
-    """Index the audio files in `directory` by the YouTube video ID found in their tags."""
-    found: dict[str, ExistingTrack] = {}
-    for ext in exts:
-        for path in sorted(directory.glob(f"*.{ext}")):
-            try:
-                audio = mutagen.File(path)
-            except mutagen.MutagenError:
-                continue
-            if audio is None or not audio.tags:
-                continue
-            values = {k: [v.decode(errors="replace") if isinstance(v, bytes) else str(v) for v in vs]
-                      for k, vs in audio.tags.items() if k not in _SKIP_TAGS}  # fmt: skip
-            video_id = next((m[1] for vs in values.values() for v in vs if (m := _VIDEO_ID_RE.search(v))), None)
-            if video_id is None:
-                continue
-            artist = _first(values, "artist", "©ART")
-            title = _first(values, "title", "©nam")
-            date = _first(values, "date", "©day") or ""
-            fields = {
-                "artist": artist or "Unknown Artist",
-                "title": title,
-                "album": _first(values, "album", "©alb"),
-                # A bare year is the release year ltube tagged; a full date is YouTube's upload
-                # date (older downloads), which isn't the year a fresh download would name.
-                "year": date if re.fullmatch(r"\d{4}", date) else None,
-            }
-            label = f"{fields['artist']} - {title or path.stem}"
-            found.setdefault(video_id, ExistingTrack(path, label, audio.info.length or None, fields))
-    return found
-
-
-def _first(tags: dict[str, list[str]], *keys: str) -> str | None:
-    return next((tags[k][0] for k in keys if tags.get(k)), None)
+def retag_album(
+    path: Path, *, album: str, album_artist: str | None, track_number: int, track_total: int | None, year: int | None
+) -> None:
+    """Put a track on an album in place: album, album artist, track number (with the album's
+    track count) and release year. Other tags and the embedded cover are kept.
+    """
+    try:
+        audio = mutagen.File(path)
+    except mutagen.MutagenError as e:
+        raise ValueError(f"can't read the tags of {path.name}: {e}") from e
+    if audio is None:
+        raise ValueError(f"{path.name} is not an audio file mutagen can tag")
+    if isinstance(audio, mutagen.mp4.MP4):
+        audio["\xa9alb"] = [album]
+        if album_artist:
+            audio["aART"] = [album_artist]
+        audio["trkn"] = [(track_number, track_total or 0)]
+        if year:
+            audio["\xa9day"] = [str(year)]
+    else:  # Ogg Opus: Vorbis comments
+        audio["album"] = [album]
+        if album_artist:
+            audio["albumartist"] = [album_artist]
+        audio["tracknumber"] = [str(track_number)]
+        if track_total:
+            audio["tracktotal"] = [str(track_total)]
+        if year:
+            audio["date"] = [str(year)]
+    try:
+        audio.save()
+    except mutagen.MutagenError as e:
+        raise ValueError(f"can't write the tags of {path.name}: {e}") from e
 
 
 def write_m3u8(path: Path, tracks: Iterable[tuple[Path, float | None, str]]) -> None:
-    """Write an extended M3U playlist; tracks are (file, duration in seconds, label)."""
+    """Write an extended M3U playlist atomically; tracks are (file, duration in seconds, label).
+
+    A media server rescanning meanwhile sees the old file or the new one, never half of it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["#EXTM3U"]
     for file, duration, label in tracks:
         lines.append(f"#EXTINF:{round(duration) if duration else -1},{label}")
         lines.append(os.path.relpath(file, path.parent))
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)

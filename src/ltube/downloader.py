@@ -16,26 +16,29 @@ from pathlib import Path
 
 import imageio_ffmpeg
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadCancelled, DownloadError, sanitize_filename
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from ltube import ytmusic
 from ltube.backoff import BackoffConfig, inner_retry_sleep
+from ltube.library import Library, Track
 from ltube.metadata import (
     ALBUM_PLAYLIST_PREFIX,
     ALBUM_TITLE_PREFIX,
-    DEFAULT_NAME_PATTERN,
+    DEFAULT_TRACK_PATTERN,
     CoverArtPP,
+    LibraryNamePP,
     NormalizeMetadataPP,
-    TrackNamePP,
-    album_folder_name,
-    track_file_name,
-    scan_existing,
+    folder_name,
+    library_location,
+    retag_album,
     write_m3u8,
 )
 
 # Final extensions we produce: AAC stays in m4a, Opus is moved from webm into an .opus
 # (Ogg) container. Both are stream copies, the audio is never re-encoded.
 AUDIO_EXTS = ("m4a", "opus")
+# Playlists are m3u files here, in the library root; the tracks themselves live in Artist/Album.
+PLAYLISTS_DIR = "playlists"
 
 # Checked in order: a rate-limit hint wins over anything else in the same message.
 _RATE_LIMITED_MARKERS = ("http error 429", "too many requests", "not a bot", "rate-limited")
@@ -105,30 +108,13 @@ class TrackResult:
 @dataclass
 class Summary:
     playlist_title: str
-    playlist_dir: Path
+    library_dir: Path
     total: int
     results: list[TrackResult] = field(default_factory=list)
     aborted: str | None = None
-    removed: list[Path] = field(default_factory=list)  # deleted because they left the playlist
 
     def count(self, status: Status) -> int:
         return sum(r.status is status for r in self.results)
-
-
-@dataclass(frozen=True)
-class Subfolders:
-    """Sort downloads into OUT/<albums>/... and OUT/<playlists>/... (relative paths)."""
-
-    albums: str
-    playlists: str
-
-
-@dataclass(frozen=True)
-class NamePatterns:
-    """Track file name patterns (see metadata.render_name), chosen by playlist kind."""
-
-    album: str = DEFAULT_NAME_PATTERN
-    playlist: str = DEFAULT_NAME_PATTERN
 
 
 @dataclass(frozen=True)
@@ -168,26 +154,11 @@ class TrackFinished:
 
 
 @dataclass(frozen=True)
-class TrackRenamed:
-    """A file already on disk was renamed to match the current name pattern."""
+class TrackMoved:
+    """A track downloaded on its own turned up on an album and was filed there (no download)."""
 
     old: Path
     new: Path
-
-
-@dataclass(frozen=True)
-class TrackRemoved:
-    """A file was deleted because its track is no longer in the playlist (prune)."""
-
-    path: Path
-    label: str
-
-
-@dataclass(frozen=True)
-class PruneSkipped:
-    """Pruning was requested but judged unsafe for this run; nothing was deleted."""
-
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -206,9 +177,7 @@ Event = (
     | TrackProgress
     | TrackRetry
     | TrackFinished
-    | TrackRenamed
-    | TrackRemoved
-    | PruneSkipped
+    | TrackMoved
     | Waiting
     | YtdlpWarning
 )
@@ -217,11 +186,11 @@ Event = (
 _PROGRESS_INTERVAL = 0.5
 
 # YouTube hides unavailable videos from playlists. yt-dlp asks for them, but if that
-# request fails it carries on silently with the shorter list, and pruning would then
-# delete tracks that are still in the playlist (just unplayable).
+# request fails it carries on silently with the shorter list, so a listing with this
+# warning may be missing tracks that are still in the playlist (just unplayable).
 _HIDDEN_UNAVAILABLE_RE = re.compile(r"unavailable videos? (?:is|are|will be) hidden", re.IGNORECASE)
-# Refuse to prune more than this share of a folder's tracks in one run.
-_PRUNE_MAX_SHARE = 0.5
+# A listing that drops more than this share of a playlist's tracks at once is not believed.
+_SHRINK_MAX_SHARE = 0.5
 
 
 @dataclass(frozen=True)
@@ -229,6 +198,14 @@ class _PlaylistItem:
     id: str
     url: str
     title: str
+
+
+@dataclass(frozen=True)
+class _Listing:
+    id: str
+    title: str
+    items: list[_PlaylistItem]
+    is_album: bool  # a YouTube Music album
 
 
 class _Logger:
@@ -268,9 +245,7 @@ class PlaylistDownloader:
         backoff: BackoffConfig,
         *,
         verbose: bool = False,
-        subfolders: Subfolders | None = None,
-        patterns: NamePatterns = NamePatterns(),
-        prune: bool = False,
+        pattern: str = DEFAULT_TRACK_PATTERN,
         on_event: Callable[[Event], None] = lambda event: None,
         stop: threading.Event | None = None,
     ) -> None:
@@ -278,10 +253,7 @@ class PlaylistDownloader:
         self.cookies = cookies
         self.backoff = backoff
         self.verbose = verbose
-        self.subfolders = subfolders
-        self.patterns = patterns
-        self.prune = prune
-        self._pattern = patterns.playlist
+        self.pattern = pattern
         self.emit = on_event
         self.stop = stop or threading.Event()
         self._base_opts: dict = {}
@@ -289,16 +261,18 @@ class PlaylistDownloader:
         self._current_index = 0
         self._current_id: str | None = None
         self._cookie_copy: Path | None = None
+        self._library: Library | None = None
+        self._album_info: dict | None = None  # looked up once per album run, {} if that failed
         # Artist/album from YouTube Music for tracks the website hides (uploads), by video ID.
         self._music: dict[str, ytmusic.MusicTrack] = {}
         self._last_progress = 0.0
 
-    def run(self, url: str, *, directory: Path | None = None) -> Summary:
-        """Download every missing track of `url`.
+    def run(self, url: str) -> Summary:
+        """Download every track of `url` that the library doesn't have yet.
 
-        By default into OUT[/<subfolder>]/<playlist or album name>; `directory` pins the exact
-        folder instead (resyncs keep using the first run's folder even if the playlist was
-        renamed or the settings changed).
+        Tracks go to OUT/Album Artist/Album/, whichever playlist or album they came from, and
+        a playlist also gets OUT/playlists/<title>.m3u8. The library is held for the whole
+        run, so a second run (another job, the CLI) waits and then finds these tracks.
         """
         with tempfile.TemporaryDirectory(prefix="ltube-") as tmp:
             # yt-dlp writes refreshed cookies back to its cookie file; keep the user's file untouched.
@@ -306,28 +280,25 @@ class PlaylistDownloader:
             shutil.copyfile(self.cookies, cookie_copy)
             self._cookie_copy = cookie_copy
             self._base_opts = self._make_base_opts(cookie_copy)
-            return self._run(url, directory)
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self._library = Library(self.out_dir)
+            with self._library.lock():
+                # Leftovers of a run that was killed; nobody else uses the staging folder now.
+                shutil.rmtree(self._library.tmp_dir, ignore_errors=True)
+                return self._run(url)
 
-    def _run(self, url: str, directory: Path | None) -> Summary:
-        title, items, is_album = self._list_playlist(url)
+    def _run(self, url: str) -> Summary:
+        library = self._library
+        assert library is not None
+        listing = self._list_playlist(url)
+        title, items, is_album = listing.title, listing.items, listing.is_album
         listing_warnings = list(self._logger.warnings)
-        self._pattern = self.patterns.album if is_album else self.patterns.playlist
-        if directory is not None:
-            playlist_dir, title = directory, directory.name
-        else:
-            if is_album and items:
-                title = self._album_name(title, items[0])
-            root = self.out_dir
-            if self.subfolders:
-                root /= self.subfolders.albums if is_album else self.subfolders.playlists
-            playlist_dir = root / sanitize_filename(title)
-        playlist_dir.mkdir(parents=True, exist_ok=True)
-        summary = Summary(title, playlist_dir, len(items))
-        width = max(2, len(str(len(items))))
-        self.emit(PlaylistStarted(title, playlist_dir, len(items)))
-        # Tracks already on disk, by video ID from their tags: found without any request and
-        # regardless of their number prefix, which shifts when the playlist changes.
-        on_disk = self._rename_existing(items, scan_existing(playlist_dir), width)
+        self._album_info = None
+        summary = Summary(title, self.out_dir, len(items))
+        self.emit(PlaylistStarted(title, self.out_dir, len(items)))
+        # The order is remembered at once, so even a cancelled or failed run leaves a playlist
+        # file with everything downloaded so far, in the right order.
+        playlist = self._record_playlist(listing, listing_warnings) if items and not is_album else None
 
         failures_in_row = 0
         previous: Status | None = None
@@ -344,8 +315,12 @@ class PlaylistDownloader:
                 self._current_index = idx
                 self._current_id = item.id
                 result = None
-                if known := on_disk.get(item.id):
-                    result = TrackResult(Status.EXISTS, known.path, known.label, known.duration)
+                # Already in the library (from any playlist or album): no request and no pause.
+                if known := library.get_track(item.id):
+                    if is_album and known.album is None:
+                        known = self._file_under_album(known, listing, idx) or known
+                    label = f"{known.artist or 'Unknown Artist'} - {known.title or known.path.stem}"
+                    result = TrackResult(Status.EXISTS, known.path, label, known.duration_s)
                 else:
                     # Full pause after real downloads/failures, a short one after cheap lookups.
                     heavy = previous in (Status.DOWNLOADED, Status.FAILED)
@@ -353,7 +328,8 @@ class PlaylistDownloader:
 
                 self.emit(TrackStarted(idx, len(items), item.title))
                 if result is None:
-                    result = self._download_track(item.url, playlist_dir, f"{idx:0{width}d}")
+                    # An album's tracks are numbered by their place on it.
+                    result = self._download_track(item.url, idx if is_album else None)
                     previous = result.status
                 summary.results.append(result)
                 self.emit(TrackFinished(idx, result))
@@ -362,24 +338,132 @@ class PlaylistDownloader:
                 if failures_in_row >= self.backoff.max_consecutive_failures:
                     summary.aborted = f"{failures_in_row} tracks failed in a row"
                     break
-            if self.prune and summary.aborted is None:
-                self._prune(items, on_disk, listing_warnings, summary)
         except RateLimitedError as e:
             summary.aborted = f"YouTube is rate-limiting this session: {e}"
         except Cancelled:
             summary.aborted = Cancelled.msg
         finally:
             # Albums need no playlist file: track numbers and album tags already order them.
-            if not is_album:
-                write_m3u8(
-                    playlist_dir / f"{sanitize_filename(title)}.m3u8",
-                    ((r.path, r.duration, r.label) for r in summary.results if r.path),
-                )
+            if playlist:
+                self._write_playlist_file(listing.id, *playlist)
         return summary
 
-    def _list_playlist(self, url: str) -> tuple[str, list[_PlaylistItem], bool]:
-        """Playlist title, its tracks, and whether it is a YouTube Music album."""
-        self._logger.warnings.clear()  # _prune checks what this listing warned about
+    def _record_playlist(self, listing: _Listing, warnings: list[str]) -> tuple[str, str | None]:
+        """Remember the playlist's tracks and their order; returns its m3u file name and the
+        one it had before (to be removed if the playlist was renamed).
+
+        A listing that may be incomplete only adds to what is remembered: a track missing from
+        it may merely be unplayable (hidden by YouTube), not removed from the playlist.
+        """
+        library = self._library
+        assert library is not None
+        ids = [item.id for item in listing.items]
+        previous = library.get_playlist(listing.id)
+        m3u_name = self._m3u_name(listing.id, listing.title)
+        old = library.playlist_items(listing.id)
+        gone = [video_id for video_id in dict.fromkeys(old) if video_id not in set(ids)]
+        if gone and (reason := _untrusted_listing(warnings, old, gone)):
+            library.merge_playlist_items(listing.id, listing.title, ids, m3u_name=m3u_name)
+            self.emit(YtdlpWarning(f"kept {len(gone)} tracks that are no longer listed: {reason}"))
+        else:
+            library.set_playlist_items(listing.id, listing.title, ids, m3u_name=m3u_name)
+        return m3u_name, previous.m3u_name if previous else None
+
+    def _m3u_name(self, playlist_id: str, title: str) -> str:
+        assert self._library is not None
+        base = folder_name(title, "Playlist")
+        owner = self._library.playlist_with_m3u_name(f"{base}.m3u8")
+        # Two playlists with one title must not share a file.
+        return f"{base}.m3u8" if owner is None or owner.playlist_id == playlist_id else f"{base} ({playlist_id}).m3u8"
+
+    def _write_playlist_file(self, playlist_id: str, m3u_name: str, old_name: str | None) -> None:
+        """Write playlists/<title>.m3u8 from the index: every downloaded track of the playlist,
+        whichever run fetched it.
+        """
+        assert self._library is not None
+        folder = self.out_dir / PLAYLISTS_DIR
+        tracks = self._library.playlist_tracks(playlist_id)
+        write_m3u8(
+            folder / m3u_name,
+            ((t.path, t.duration_s, f"{t.artist or 'Unknown Artist'} - {t.title or t.path.stem}") for t in tracks),
+        )
+        if old_name and old_name != m3u_name:
+            (folder / old_name).unlink(missing_ok=True)
+
+    def _file_under_album(self, known: Track, listing: _Listing, position: int) -> Track | None:
+        """A track that came in on its own (so it sits in Singles) is on this album: tag it
+        and move it into the album's folder, with no download. None if that isn't possible.
+        """
+        assert self._library is not None
+        album = self._album_of(listing)
+        if not album:
+            return None
+        info = {
+            "id": known.video_id,
+            "title": known.title,
+            "artist": known.artist,
+            "artists": [known.artist] if known.artist else [],
+            "album": album["album"],
+            "album_artists": [album["artist"]] if album["artist"] else [],
+        }
+        folder, name = library_location(self.pattern, info, position)
+        new = self.out_dir / folder / f"{name}{known.path.suffix}"
+        if new.exists():
+            self.emit(YtdlpWarning(f"left {known.path.name} in {known.path.parent.name}: {new.name} already exists"))
+            return None
+        try:
+            retag_album(
+                known.path,
+                album=album["album"],
+                album_artist=album["artist"],
+                track_number=position,
+                track_total=len(listing.items),
+                year=album["year"],
+            )
+        except ValueError as e:
+            self.emit(YtdlpWarning(f"left {known.path.name} where it is: {e}"))
+            return None
+        new.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(known.path, new)
+        self._library.move_track(
+            known.video_id, new, album=album["album"], album_artist=album["artist"], track_number=position
+        )
+        _remove_empty_dirs(known.path.parent, self.out_dir)
+        self.emit(TrackMoved(known.path, new))
+        return self._library.get_track(known.video_id)
+
+    def _album_of(self, listing: _Listing) -> dict | None:
+        """Album, album artist and year, from the first track's metadata: the playlist itself
+        carries neither artist nor year. One request per album run, and only when needed.
+        """
+        if self._album_info is None:
+            self._album_info = {}
+            try:
+                info = self._track_info(listing.items[0].url)
+            except DownloadError as e:
+                self.emit(YtdlpWarning(f"couldn't look up the album, so tracks stay where they are: {_clean(e)}"))
+            else:
+                self._album_info = {
+                    "album": info.get("album") or listing.title.removeprefix(ALBUM_TITLE_PREFIX),
+                    "artist": (info.get("artists") or [None])[0],
+                    "year": info.get("release_year"),
+                }
+        return self._album_info or None
+
+    def _track_info(self, url: str) -> dict:
+        self._check_stop()
+        with YoutubeDL(self._base_opts | {"format": "bestaudio"}) as ydl:
+            ydl.add_post_processor(NormalizeMetadataPP(), when="pre_process")
+            try:
+                return ydl.extract_info(url, download=False)
+            except DownloadError as e:
+                if classify(str(e)) is ErrorKind.RATE_LIMITED:
+                    raise RateLimitedError(_clean(e)) from e
+                raise
+
+    def _list_playlist(self, url: str) -> _Listing:
+        """The playlist's ID and title, its tracks, and whether it is a YouTube Music album."""
+        self._logger.warnings.clear()  # _run checks what this listing warned about
         info = self._extract_listing(url, signed_in=True)
         if not info or "entries" not in info:
             raise NotAPlaylistError(f"{url} is not a playlist")
@@ -388,7 +472,8 @@ class PlaylistDownloader:
         if len(items) < expected and any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in self._logger.warnings):
             items = self._recover_hidden(url, info.get("id") or "", items, expected)
         is_album = (info.get("id") or "").startswith(ALBUM_PLAYLIST_PREFIX)
-        return info.get("title") or info.get("id") or "Untitled playlist", items, is_album
+        title = info.get("title") or info.get("id") or "Untitled playlist"
+        return _Listing(info.get("id") or title, title, items, is_album)
 
     def _extract_listing(self, url: str, *, signed_in: bool) -> dict:
         opts = self._base_opts | {"extract_flat": "in_playlist", "noplaylist": False}
@@ -442,102 +527,10 @@ class PlaylistDownloader:
             self._logger.warnings = [w for w in self._logger.warnings if not _HIDDEN_UNAVAILABLE_RE.search(w)]
         return merged
 
-    def _rename_existing(self, items: list[_PlaylistItem], on_disk: dict, width: int) -> dict:
-        """Rename tracks already on disk to what the current pattern and playlist positions
-        would name them, from their own tags (no requests). Returns `on_disk` with new paths.
-
-        Two phases (all to temporary names, then to final ones), so swaps like 01<->02 work.
-        A name taken by a file ltube isn't moving is never overwritten.
-        """
-        plan: dict[str, tuple] = {}
-        for idx, item in enumerate(items, 1):
-            track = on_disk.get(item.id)
-            if track is None or item.id in plan or not track.fields.get("title"):
-                continue
-            name = track_file_name(self._pattern, track.fields | {"number": f"{idx:0{width}d}"})
-            new = track.path.with_name(name + track.path.suffix)
-            if new != track.path:
-                plan[item.id] = (track, new)
-
-        moving = {track.path for track, _ in plan.values()}
-        claimed: set[Path] = set()
-        staged = []
-        for vid, (track, new) in plan.items():
-            taken = new.exists() and new not in moving and not new.samefile(track.path)
-            if taken or new in claimed:
-                self.emit(YtdlpWarning(f"kept {track.path.name}: {new.name} already exists"))
-                continue
-            claimed.add(new)
-            tmp = track.path.with_name(f".ltube-rename-{vid}{track.path.suffix}")
-            track.path.rename(tmp)
-            staged.append((vid, track, tmp, new))
-
-        renamed = dict(on_disk)
-        for vid, track, tmp, new in staged:
-            if new.exists():  # appeared since planning; never overwrite
-                new = new.with_name(f"{new.stem} ({vid}){new.suffix}")
-            tmp.rename(new)
-            renamed[vid] = replace(track, path=new)
-            self.emit(TrackRenamed(track.path, new))
-        return renamed
-
-    def _prune(
-        self, items: list[_PlaylistItem], on_disk: dict, listing_warnings: list[str], summary: Summary
-    ) -> None:
-        """Delete files whose track left the playlist, if the listing can be trusted.
-
-        Only files identified by the video ID in their tags are candidates, so anything
-        ltube didn't download is never touched.
-        """
-        listed = {item.id for item in items}
-        stale = [(vid, track) for vid, track in on_disk.items() if vid not in listed]
-        if not stale:
-            return
-        if any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in listing_warnings):
-            self.emit(PruneSkipped("YouTube hid unavailable videos, so the track list may be incomplete"))
-            return
-        if len(stale) > 2 and len(stale) > len(on_disk) * _PRUNE_MAX_SHARE:
-            self.emit(
-                PruneSkipped(
-                    f"{len(stale)} of {len(on_disk)} tracks would be deleted; "
-                    "refusing to delete more than half at once, remove them by hand if this is intended"
-                )
-            )
-            return
-        for _, track in stale:
-            self._check_stop()
-            track.path.unlink(missing_ok=True)
-            summary.removed.append(track.path)
-            self.emit(TrackRemoved(track.path, track.label))
-
-    def _album_name(self, playlist_title: str, first: _PlaylistItem) -> str:
-        """Albums are named "Artist - Year - Album" from the first track's music metadata.
-
-        The playlist itself carries neither artist nor year, and its uploader is a channel
-        name that can differ from the artist, so this costs one extra metadata lookup.
-        """
-        info = self._track_info(first.url)
-        album = info.get("album") or playlist_title.removeprefix(ALBUM_TITLE_PREFIX)
-        artist = (info.get("artists") or [None])[0]
-        return album_folder_name(artist, info.get("release_year"), album)
-
-    def _track_info(self, url: str) -> dict:
-        self._check_stop()
-        with YoutubeDL(self._base_opts | {"format": "bestaudio"}) as ydl:
-            ydl.add_post_processor(NormalizeMetadataPP(), when="pre_process")
-            try:
-                return ydl.extract_info(url, download=False)
-            except DownloadError as e:
-                if classify(str(e)) is ErrorKind.RATE_LIMITED:
-                    raise RateLimitedError(_clean(e)) from e
-                raise
-
-    def _download_track(self, url: str, playlist_dir: Path, prefix: str) -> TrackResult:
-        # TrackNamePP renders the user's pattern into ltube_name; yt-dlp sanitizes it.
-        outtmpl = str(playlist_dir).replace("%", "%%") + os.sep + "%(ltube_name)s.%(ext)s"
+    def _download_track(self, url: str, number: int | None) -> TrackResult:
         for attempt in range(self.backoff.retries + 1):
             try:
-                return self._attempt(url, outtmpl, prefix)
+                return self._attempt(url, number)
             except DownloadError as e:
                 message = _clean(e)
                 kind = classify(message)
@@ -582,32 +575,43 @@ class PlaylistDownloader:
             )
         )
 
-    def _attempt(self, url: str, outtmpl: str, prefix: str) -> TrackResult:
+    def _attempt(self, url: str, number: int | None) -> TrackResult:
+        library = self._library
+        assert library is not None and self._current_id is not None
         self._check_stop()
-        with YoutubeDL(self._base_opts | self._track_opts(outtmpl)) as ydl:
-            ydl.add_post_processor(NormalizeMetadataPP(self._music.get(self._current_id)), when="pre_process")
-            ydl.add_post_processor(TrackNamePP(self._pattern, prefix), when="pre_process")
-            ydl.add_post_processor(CoverArtPP(ydl), when="before_dl")
-            ydl.add_progress_hook(self._on_progress)
-            info = ydl.extract_info(url, download=False)
-            label = f"{info.get('artist') or 'Unknown Artist'} - {info.get('track') or info.get('title')}"
-            target = Path(ydl.prepare_filename(info))
+        # The track is built in its own staging folder and moved into the library only when it
+        # is complete and tagged, so nothing half-done is ever in the library (or taken for a
+        # finished track by the index), whatever way the attempt ends.
+        staging = library.tmp_dir / self._current_id
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        outtmpl = str(staging).replace("%", "%%") + os.sep + "%(ltube_name)s.%(ext)s"
+        try:
+            with YoutubeDL(self._base_opts | self._track_opts(outtmpl)) as ydl:
+                ydl.add_post_processor(NormalizeMetadataPP(self._music.get(self._current_id)), when="pre_process")
+                ydl.add_post_processor(LibraryNamePP(self.pattern, number), when="pre_process")
+                ydl.add_post_processor(CoverArtPP(ydl), when="before_dl")
+                ydl.add_progress_hook(self._on_progress)
+                info = ydl.extract_info(url, download=False)
+                label = f"{info.get('artist') or 'Unknown Artist'} - {info.get('track') or info.get('title')}"
+                folder = self.out_dir / info["ltube_dir"]
 
-            if existing := _find_existing(target):
-                return TrackResult(Status.EXISTS, existing, label, info.get("duration"))
+                # The file is there but the index doesn't know it (e.g. the index was lost).
+                if existing := _find_existing(folder / info["ltube_name"]):
+                    library.add_track(info["id"], existing, **_index_tags(info))
+                    return TrackResult(Status.EXISTS, existing, label, info.get("duration"))
 
-            before = set(target.parent.iterdir()) if target.parent.exists() else set()
-            try:
                 ydl.process_ie_result(info, download=True)
-            except BaseException:
-                # Never leave a half-processed file (e.g. untagged after a failed post-processing
-                # step): a retry or resync would take it for a finished track.
-                _remove_new_outputs(target, before)
-                raise
-            path = _find_existing(target)
-            if path is None:
-                raise DownloadError(f"download finished but no audio file found next to {target}")
+            staged = _find_staged(staging)
+            if staged is None:
+                raise DownloadError(f"download finished but no audio file found in {staging}")
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / staged.name
+            os.replace(staged, path)
+            library.add_track(info["id"], path, **_index_tags(info))
             return TrackResult(Status.DOWNLOADED, path, label, info.get("duration"))
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def _make_base_opts(self, cookiefile: Path) -> dict:
         opts = {
@@ -658,27 +662,48 @@ def _playlist_items(info: dict) -> list[_PlaylistItem]:
     ]
 
 
-def _remove_new_outputs(target: Path, before: set[Path]) -> None:
-    """Delete the files a failed attempt created for this track (audio, .part, thumbnails).
-
-    Only files that didn't exist before the attempt, so another track whose name merely
-    starts the same way is never touched.
-    """
-    if not target.parent.exists():
-        return
-    prefix = target.stem + "."
-    for path in set(target.parent.iterdir()) - before:
-        if path.name.startswith(prefix) and path.is_file():
-            path.unlink(missing_ok=True)
+def _untrusted_listing(warnings: list[str], old: list[str], gone: list[str]) -> str | None:
+    """Why a listing that lacks `gone` (tracks the playlist held before) can't be believed, if so."""
+    if any(_HIDDEN_UNAVAILABLE_RE.search(w) for w in warnings):
+        return "YouTube hid unavailable videos, so the track list may be incomplete"
+    if len(gone) > 2 and len(gone) > len(old) * _SHRINK_MAX_SHARE:
+        return f"{len(gone)} of {len(old)} tracks vanished at once"
+    return None
 
 
-def _find_existing(target: Path) -> Path | None:
-    """The final file for `target`, whatever audio container it ended up in."""
+def _remove_empty_dirs(folder: Path, root: Path) -> None:
+    """Remove `folder` and then its parents, up to but not including `root`, while they are empty."""
+    while folder != root and root in folder.parents:
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
+
+
+def _find_existing(base: Path) -> Path | None:
+    """The final file for `base` (a path without extension), whatever audio container it is in."""
     for ext in AUDIO_EXTS:
-        candidate = target.with_suffix(f".{ext}")
+        candidate = base.with_name(f"{base.name}.{ext}")
         if candidate.exists():
             return candidate
     return None
+
+
+def _find_staged(staging: Path) -> Path | None:
+    return next((p for ext in AUDIO_EXTS for p in sorted(staging.glob(f"*.{ext}"))), None)
+
+
+def _index_tags(info: dict) -> dict:
+    album_artists = info.get("album_artists") or []
+    return {
+        "artist": info.get("artist"),
+        "title": info.get("track") or info.get("title"),
+        "album": info.get("album"),
+        "album_artist": album_artists[0] if album_artists else None,
+        "track_number": info.get("track_number"),
+        "duration_s": info.get("duration"),
+    }
 
 
 def _clean(error: Exception) -> str:

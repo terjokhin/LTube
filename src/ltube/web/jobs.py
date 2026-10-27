@@ -15,21 +15,18 @@ from pathlib import Path
 from ltube.backoff import BackoffConfig
 from ltube.downloader import (
     Event,
-    NamePatterns,
     PlaylistStarted,
-    PruneSkipped,
     Status,
-    Subfolders,
     Summary,
     TrackFinished,
+    TrackMoved,
     TrackProgress,
-    TrackRemoved,
-    TrackRenamed,
     TrackRetry,
     TrackStarted,
     Waiting,
     YtdlpWarning,
 )
+from ltube.metadata import DEFAULT_TRACK_PATTERN
 
 # Finished jobs kept in memory for the UI; older ones are forgotten.
 MAX_FINISHED_JOBS = 50
@@ -51,18 +48,14 @@ class Job:
     out_dir: Path
     backoff: BackoffConfig
     playlist_id: str | None = None  # the PlaylistStore record this run updates
-    subfolders: Subfolders | None = None
-    patterns: NamePatterns = field(default_factory=NamePatterns)
-    target_dir: Path | None = None  # exact folder of an earlier run (resyncs)
-    prune: bool = False  # delete tracks that left the playlist (resyncs)
+    pattern: str = DEFAULT_TRACK_PATTERN  # track file name, copied from Settings when submitted
     created_at: float = field(default_factory=time.time)
     state: JobState = JobState.QUEUED
     title: str | None = None
     directory: str | None = None
     total: int | None = None
     tracks: list[dict] = field(default_factory=list)
-    removed: list[str] = field(default_factory=list)  # file names deleted by pruning
-    renamed: int = 0  # files renamed to the current pattern
+    moved: int = 0  # tracks filed under their album after turning up on one
     current: dict | None = None
     waiting_until: float | None = None
     messages: list[str] = field(default_factory=list)
@@ -89,14 +82,9 @@ class Job:
                 self.waiting_until = time.time() + seconds
             case YtdlpWarning(message):
                 self._note(f"warning: {message}")
-            case TrackRenamed(old, new):
-                self.renamed += 1
-                self._note(f"renamed {old.name} → {new.name}")
-            case TrackRemoved(path, _):
-                self.removed.append(path.name)
-                self._note(f"removed {path.name}: no longer in the playlist")
-            case PruneSkipped(reason):
-                self._note(f"kept tracks that left the playlist: {reason}")
+            case TrackMoved(old, new):
+                self.moved += 1
+                self._note(f"moved {old.name} → {new.parent.name}/{new.name}")
             case TrackFinished(index, result):
                 track = {
                     "index": index,
@@ -130,10 +118,8 @@ class Job:
         counts: dict[str, int] = {}
         for t in self.tracks:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
-        if self.renamed:
-            counts["renamed"] = self.renamed
-        if self.removed:
-            counts["removed"] = len(self.removed)
+        if self.moved:
+            counts["moved"] = self.moved
         data = {
             "id": self.id,
             "url": self.url,
@@ -177,7 +163,7 @@ class JobManager:
         self._worker: threading.Thread | None = None
 
     def submit(self, url: str, out_dir: Path, backoff: BackoffConfig, **options) -> Job:
-        """`options`: the optional Job fields (playlist_id, subfolders, patterns, target_dir, prune)."""
+        """`options`: the optional Job fields (playlist_id, pattern)."""
         job = Job(id=uuid.uuid4().hex[:12], url=url, out_dir=out_dir, backoff=backoff, **options)
         with self._lock:
             self._jobs[job.id] = job
